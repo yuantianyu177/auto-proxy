@@ -1,0 +1,11 @@
+/target/
+/dist/
+/.ap-test/
+*.log
+.DS_Store
+.env
+.env.*
+*.p12
+*.pfx
+*.key
+*.mobileprovision

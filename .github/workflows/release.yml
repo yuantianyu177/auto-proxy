@@ -1,0 +1,235 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Cargo package version; blank uses Cargo.toml (manual runs never publish)"
+        required: false
+        type: string
+      require_macos_signing:
+        description: "Fail a manual dry-run unless Developer ID signing secrets are configured"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Validate release request
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      publish: ${{ steps.release.outputs.publish }}
+      require_signing: ${{ steps.release.outputs.require_signing }}
+      bundle_name: ${{ steps.release.outputs.bundle_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: release
+        name: Validate version and release policy
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUEST_SIGNING: ${{ inputs.require_macos_signing }}
+        run: |
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            if [[ "${GITHUB_REF_TYPE}" != "tag" || ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+              echo "release tag must be v<semver>, got ${GITHUB_REF_NAME}" >&2
+              exit 1
+            fi
+            version="${GITHUB_REF_NAME#v}"
+            publish=true
+            require_signing=true
+            bundle_name="ap-v${version}-release-bundle"
+          else
+            version="${REQUESTED_VERSION:-$cargo_version}"
+            publish=false
+            require_signing="${REQUEST_SIGNING:-false}"
+            bundle_name="ap-v${version}-dry-run-bundle"
+          fi
+
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "version must be valid semver, got ${version}" >&2
+            exit 1
+          fi
+          if [[ "${version}" != "${cargo_version}" ]]; then
+            echo "requested version ${version} does not match Cargo.toml ${cargo_version}" >&2
+            exit 1
+          fi
+
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "publish=${publish}" >> "${GITHUB_OUTPUT}"
+          echo "require_signing=${require_signing}" >> "${GITHUB_OUTPUT}"
+          echo "bundle_name=${bundle_name}" >> "${GITHUB_OUTPUT}"
+
+  quality:
+    name: Test, Clippy, and rustfmt release source
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust components
+        run: rustup component add clippy rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --locked --all-targets --all-features
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs:
+      - prepare
+      - quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            builder: cross
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            builder: cross
+          - target: x86_64-apple-darwin
+            os: macos-14
+            builder: cargo
+          - target: aarch64-apple-darwin
+            os: macos-14
+            builder: cargo
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-${{ runner.os }}-${{ matrix.target }}-
+      - name: Install cross
+        if: matrix.builder == 'cross'
+        run: cargo install cross --locked --version 0.2.5
+      - name: Build Linux release binary
+        if: matrix.builder == 'cross'
+        run: cross build --locked --release --target "${{ matrix.target }}"
+      - name: Build macOS release binary
+        if: matrix.builder == 'cargo'
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Sign or gate macOS binary
+        if: runner.os == 'macOS'
+        env:
+          AP_MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.AP_MACOS_CERTIFICATE_P12_BASE64 }}
+          AP_MACOS_CERTIFICATE_PASSWORD: ${{ secrets.AP_MACOS_CERTIFICATE_PASSWORD }}
+          AP_MACOS_SIGNING_IDENTITY: ${{ secrets.AP_MACOS_SIGNING_IDENTITY }}
+          REQUIRE_SIGNING: ${{ needs.prepare.outputs.require_signing }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/ap"
+          configured_secrets=0
+          if [[ -n "${AP_MACOS_CERTIFICATE_P12_BASE64}" ]]; then
+            configured_secrets=$((configured_secrets + 1))
+          fi
+          if [[ -n "${AP_MACOS_CERTIFICATE_PASSWORD}" ]]; then
+            configured_secrets=$((configured_secrets + 1))
+          fi
+          if [[ -n "${AP_MACOS_SIGNING_IDENTITY}" ]]; then
+            configured_secrets=$((configured_secrets + 1))
+          fi
+
+          if [[ "${configured_secrets}" -eq 3 ]]; then
+            bash scripts/sign-macos.sh "${binary}"
+          elif [[ "${configured_secrets}" -ne 0 ]]; then
+            echo "macOS signing is partially configured; all three AP_MACOS_* secrets are required" >&2
+            exit 1
+          elif [[ "${REQUIRE_SIGNING}" == "true" ]]; then
+            echo "stable/tagged releases require all three AP_MACOS_* signing secrets" >&2
+            exit 1
+          else
+            echo "manual dry-run: macOS artifact is intentionally unsigned"
+          fi
+      - name: Package target
+        run: |
+          bash scripts/package-release.sh \
+            "${{ matrix.target }}" \
+            "${{ needs.prepare.outputs.version }}" \
+            "target/${{ matrix.target }}/release/ap" \
+            dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle:
+    name: Generate SBOM and checksums
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Generate CycloneDX SBOM
+        run: |
+          install -m 0644 README.md LICENSE CHANGELOG.md dist/
+          bash scripts/generate-sbom.sh \
+            "${{ needs.prepare.outputs.version }}" \
+            "dist/ap-v${{ needs.prepare.outputs.version }}-sbom.cdx.json"
+      - name: Generate and verify SHA256SUMS
+        run: |
+          bash scripts/sha256sums.sh "${{ needs.prepare.outputs.version }}" dist
+          bash scripts/verify-release-bundle.sh "${{ needs.prepare.outputs.version }}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.bundle_name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub release
+    if: needs.prepare.outputs.publish == 'true'
+    needs:
+      - prepare
+      - bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.prepare.outputs.bundle_name }}
+          path: dist
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "${RELEASE_TAG}" dist/* \
+            --verify-tag \
+            --generate-notes \
+            --title "ap ${RELEASE_TAG}"
