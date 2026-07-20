@@ -16,6 +16,10 @@
 - macOS Keychain/Linux Secret Service 的显式真实 CRUD 测试，以及 Linux 无会话 D-Bus 时禁止明文文件回退的自动测试。
 - 不含秘密值的跨存储事务日志与启动恢复，覆盖 server 和 SSH 密码的新增/删除崩溃窗口。
 
+### Fixed
+
+- macOS 默认将 OpenSSH ControlMaster socket 放入当前 UID 专属的短路径私有运行目录，避免 `~/Library/Application Support` 加上 OpenSSH 临时后缀后超过 Unix socket 路径上限而产生 `AP_SSH_EXITED`。
+
 ### Security
 
 - stored-password 模式仅信任 root-owned 且普通用户不可替换的系统 OpenSSH，并拒绝可继承 AskPass 环境的 SSH 本地 helper。

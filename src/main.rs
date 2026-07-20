@@ -687,11 +687,7 @@ async fn run_doctor(store: &ConfigStore, paths: &AppPaths, server_name: &str) ->
             .iter()
             .map(|mapping| mapping.remote_port)
             .collect(),
-        control_socket: paths.control_dir.join(format!(
-            "doctor-{}-{}.sock",
-            server.id.simple(),
-            std::process::id()
-        )),
+        control_socket: paths.doctor_control_socket(),
     });
     let report = doctor::run(DoctorRequest {
         ssh_executable: system_ssh_executable()?,

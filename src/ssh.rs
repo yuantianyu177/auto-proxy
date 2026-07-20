@@ -6,7 +6,8 @@ use std::fs;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -24,11 +25,26 @@ use zeroize::Zeroizing;
 #[cfg(target_os = "macos")]
 use crate::askpass::process_code_matches_current;
 use crate::askpass::{AskpassBroker, PasswordProvider};
+use crate::config::ensure_control_dir;
 use crate::error::{ApError, Result};
 
 const STDERR_LIMIT: usize = 64 * 1024;
 const CONFIG_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+// OpenSSH first binds a temporary multiplex socket by appending a suffix to
+// ControlPath. Keep enough headroom for that suffix instead of accepting a
+// path that the final socket alone could fit. The limits leave 23 bytes on
+// macOS and 19 bytes on Linux below each platform's usable sun_path capacity;
+// Linux therefore does not inherit macOS's more conservative limit.
+#[cfg(target_os = "macos")]
+const MAX_CONTROL_PATH_BYTES: usize = 80;
+#[cfg(target_os = "linux")]
+const MAX_CONTROL_PATH_BYTES: usize = 88;
+#[cfg(target_os = "macos")]
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
+#[cfg(target_os = "linux")]
+const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
+const MAX_ASKPASS_SOCKET_FILE_BYTES: usize = 44;
 const ANONYMOUS_CONFIG_PATH: &str = "/dev/stdin";
 const WATCHDOG_MODE_ENV: &str = "AP_SSH_WATCHDOG_MODE";
 const WATCHDOG_MODE_VALUE: &str = "ssh-parent-v1";
@@ -160,6 +176,41 @@ impl SshOptions {
 
     pub fn validate(&self) -> Result<()> {
         validate_host_alias(&self.host)?;
+        let control_path_bytes = self.control_socket.as_os_str().as_bytes();
+        if control_path_bytes.contains(&b'%') {
+            return Err(ApError::coded(
+                "AP_SSH_CONTROL_PATH_TOKEN",
+                "OpenSSH ControlPath 不能包含 `%`，请更换 AP_CONFIG_DIR",
+            ));
+        }
+        if control_path_bytes.len() > MAX_CONTROL_PATH_BYTES {
+            return Err(ApError::coded(
+                "AP_SSH_CONTROL_PATH_TOO_LONG",
+                "OpenSSH ControlPath 过长；请缩短 AP_CONFIG_DIR，或使用平台默认配置目录",
+            ));
+        }
+        if matches!(
+            self.authentication,
+            SshAuthentication::StoredPassword { .. }
+        ) {
+            let parent = self.control_socket.parent().ok_or_else(|| {
+                ApError::coded(
+                    "AP_SSH_CONTROL_PATH",
+                    "control socket has no parent directory",
+                )
+            })?;
+            let askpass_path_bytes = parent
+                .as_os_str()
+                .as_bytes()
+                .len()
+                .saturating_add(1 + MAX_ASKPASS_SOCKET_FILE_BYTES);
+            if askpass_path_bytes > MAX_UNIX_SOCKET_PATH_BYTES {
+                return Err(ApError::coded(
+                    "AP_ASKPASS_SOCKET_PATH_TOO_LONG",
+                    "AskPass Unix socket 路径过长；请缩短 AP_CONFIG_DIR，或使用平台默认配置目录",
+                ));
+            }
+        }
         if self.forwards.is_empty() {
             return Err(ApError::coded(
                 "AP_SSH_NO_FORWARD",
@@ -1203,9 +1254,7 @@ fn prepare_control_parent(control_socket: &Path) -> Result<()> {
             "control socket has no parent directory",
         )
     })?;
-    fs::create_dir_all(parent)?;
-    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    Ok(())
+    ensure_control_dir(parent)
 }
 
 fn remove_stale_control_socket(path: &Path) -> Result<()> {
@@ -1393,6 +1442,10 @@ fn ssh_exit_error(code: Option<i32>, raw_stderr: &str) -> ApError {
     let lowercase = raw_stderr.to_ascii_lowercase();
     let error_code = if lowercase.contains("permission denied") {
         "AP_SSH_AUTH_FAILED"
+    } else if lowercase.contains("controlpath too long")
+        || lowercase.contains("unix_listener") && lowercase.contains("too long")
+    {
+        "AP_SSH_CONTROL_PATH_TOO_LONG"
     } else if lowercase.contains("remote port forwarding failed")
         || lowercase.contains("cannot listen to port")
     {
@@ -1411,6 +1464,9 @@ fn ssh_exit_error(code: Option<i32>, raw_stderr: &str) -> ApError {
     // resolved host, user name, key paths, ProxyCommand output, or credentials.
     let details = match error_code {
         "AP_SSH_AUTH_FAILED" => "SSH password authentication failed".to_owned(),
+        "AP_SSH_CONTROL_PATH_TOO_LONG" => {
+            "OpenSSH ControlPath exceeded the platform Unix-socket limit".to_owned()
+        }
         "AP_SSH_FORWARD_FAILED" => {
             "OpenSSH could not establish every requested remote forwarding port".to_owned()
         }
@@ -1495,6 +1551,80 @@ mod tests {
         let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
         options.host = "-oProxyCommand=bad".to_owned();
         assert!(build_master_args(&options).is_err());
+    }
+
+    #[test]
+    fn rejects_control_paths_without_openssh_temporary_headroom() {
+        let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
+        options.control_socket = PathBuf::from(format!("/{}", "x".repeat(MAX_CONTROL_PATH_BYTES)));
+        assert_eq!(
+            build_master_args(&options).unwrap_err().code(),
+            "AP_SSH_CONTROL_PATH_TOO_LONG"
+        );
+    }
+
+    #[test]
+    fn control_path_limit_accepts_boundary_and_rejects_next_byte() {
+        let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
+        options.control_socket =
+            PathBuf::from(format!("/{}", "x".repeat(MAX_CONTROL_PATH_BYTES - 1)));
+        assert_eq!(
+            options.control_socket.as_os_str().as_bytes().len(),
+            MAX_CONTROL_PATH_BYTES
+        );
+        assert!(build_master_args(&options).is_ok());
+
+        options.control_socket = PathBuf::from(format!("/{}", "x".repeat(MAX_CONTROL_PATH_BYTES)));
+        assert_eq!(
+            options.control_socket.as_os_str().as_bytes().len(),
+            MAX_CONTROL_PATH_BYTES + 1
+        );
+        assert_eq!(
+            build_master_args(&options).unwrap_err().code(),
+            "AP_SSH_CONTROL_PATH_TOO_LONG"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_accepts_a_control_path_longer_than_the_macos_limit() {
+        let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
+        options.control_socket = PathBuf::from(format!("/{}", "x".repeat(84)));
+        assert_eq!(options.control_socket.as_os_str().as_bytes().len(), 85);
+        assert!(build_master_args(&options).is_ok());
+    }
+
+    #[test]
+    fn rejects_openssh_tokens_in_control_path() {
+        let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
+        options.control_socket = PathBuf::from("/tmp/ap-%h/control.sock");
+        assert_eq!(
+            build_master_args(&options).unwrap_err().code(),
+            "AP_SSH_CONTROL_PATH_TOKEN"
+        );
+    }
+
+    #[test]
+    fn stored_password_reserves_space_for_askpass_socket() {
+        let mut options = options(SshAuthentication::StoredPassword {
+            provider: Arc::new(|| Ok(Zeroizing::new("top-secret".to_owned()))),
+        });
+        options.control_socket = PathBuf::from(format!("/{}/s", "x".repeat(70)));
+        assert!(options.control_socket.as_os_str().as_bytes().len() <= MAX_CONTROL_PATH_BYTES);
+        assert_eq!(
+            build_master_args(&options).unwrap_err().code(),
+            "AP_ASKPASS_SOCKET_PATH_TOO_LONG"
+        );
+    }
+
+    #[test]
+    fn classifies_openssh_control_path_failures() {
+        let error = ssh_exit_error(
+            Some(255),
+            "unix_listener: path too long for Unix domain socket",
+        );
+        assert_eq!(error.code(), "AP_SSH_CONTROL_PATH_TOO_LONG");
+        assert!(!error.to_string().contains("/Users/"));
     }
 
     #[test]

@@ -621,11 +621,7 @@ impl ProfileManager {
         let server = prepared.server;
         let server_id = server.id;
         let ap_executable = std::env::current_exe()?;
-        let control_socket = self
-            .store
-            .paths()
-            .control_dir
-            .join(format!("{server_id}.sock"));
+        let control_socket = self.store.paths().profile_control_socket(server_id);
 
         let status = Arc::new(Mutex::new(ProfileStatus {
             server: name.to_owned(),
@@ -1555,6 +1551,9 @@ fn is_permanent_error(code: &str) -> bool {
             | "AP_ASKPASS_PASSWORD_SIZE"
             | "AP_ASKPASS_PEER"
             | "AP_SSH_CONTROL_UNSAFE"
+            | "AP_SSH_CONTROL_PATH_TOKEN"
+            | "AP_SSH_CONTROL_PATH_TOO_LONG"
+            | "AP_ASKPASS_SOCKET_PATH_TOO_LONG"
             | "AP_SSH_CONTROL_RECLAIM_FAILED"
     )
 }

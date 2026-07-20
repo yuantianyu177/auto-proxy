@@ -159,7 +159,7 @@ AP_RUN_SERVER2_TEST=1 cargo test --test server2_dev -- --ignored --nocapture
 
 ## 配置位置
 
-默认遵循平台用户配置目录。测试时可通过 `AP_CONFIG_DIR` 指向隔离目录。目录权限为 `0700`，普通配置、自动生成的代理秘密文件和不含秘密值的恢复日志均为 `0600`；SSH 密码永远不写入这些文件。
+默认遵循平台用户配置目录。测试时可通过 `AP_CONFIG_DIR` 指向隔离目录。目录权限为 `0700`，普通配置、自动生成的代理秘密文件和不含秘密值的恢复日志均为 `0600`；SSH 密码永远不写入这些文件。macOS 的 OpenSSH ControlMaster socket 属于易失运行状态，默认使用 `/private/tmp` 下当前 UID 专属且权限为 `0700` 的短路径目录，避免 OpenSSH 创建临时 multiplex socket 时超过系统 Unix socket 路径上限。
 
 ## License
 

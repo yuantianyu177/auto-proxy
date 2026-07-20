@@ -6,7 +6,7 @@ use fs2::FileExt;
 use uuid::Uuid;
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use crate::error::{ApError, Result};
 use crate::model::{Config, ProxyMapping, ServerConfig, validate_name};
@@ -43,7 +43,20 @@ impl AppPaths {
         let base = dirs::config_dir().ok_or_else(|| {
             ApError::coded("AP_CONFIG_DIR_UNAVAILABLE", "无法确定当前用户的配置目录")
         })?;
-        Ok(Self::from_root(base.join("ap")))
+        let paths = Self::from_root(base.join("ap"));
+        // OpenSSH creates a temporary multiplex socket beside ControlPath
+        // before renaming it into place. macOS has a short sockaddr_un path
+        // limit, so ~/Library/Application Support/... leaves too little room
+        // even when the final socket itself would fit. A private per-UID
+        // directory below the sticky system /tmp keeps this runtime-only path
+        // short; configuration, locks, logs, and secrets remain in the normal
+        // application-support directory.
+        #[cfg(target_os = "macos")]
+        let paths = Self {
+            control_dir: macos_control_dir(),
+            ..paths
+        };
+        Ok(paths)
     }
 
     pub fn from_root(root: impl Into<PathBuf>) -> Self {
@@ -67,10 +80,27 @@ impl AppPaths {
     pub fn ensure(&self) -> Result<()> {
         ensure_private_dir(&self.root)?;
         ensure_private_dir(&self.runtime_dir)?;
-        ensure_private_dir(&self.control_dir)?;
+        ensure_control_dir(&self.control_dir)?;
         ensure_private_dir(&self.logs_dir)?;
         Ok(())
     }
+
+    pub fn profile_control_socket(&self, server_id: Uuid) -> PathBuf {
+        self.control_dir
+            .join(format!("p-{}.sock", server_id.simple()))
+    }
+
+    pub fn doctor_control_socket(&self) -> PathBuf {
+        self.control_dir
+            .join(format!("d-{}.sock", Uuid::new_v4().simple()))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_control_dir() -> PathBuf {
+    PathBuf::from("/private/tmp")
+        .join(format!("ap-{}", unsafe { libc::geteuid() }))
+        .join("c")
 }
 
 #[derive(Debug, Clone)]
@@ -307,7 +337,84 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
         ));
     }
     #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(ApError::coded(
+            "AP_INSECURE_PATH",
+            format!("{} 必须由当前用户拥有", path.display()),
+        ));
+    }
+    #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+pub(crate) fn ensure_control_dir(path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if path == macos_control_dir() {
+        return ensure_macos_control_dir(path);
+    }
+    ensure_private_dir(path)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_macos_control_dir(path: &Path) -> Result<()> {
+    let system_tmp = Path::new("/private/tmp");
+    let metadata = fs::symlink_metadata(system_tmp)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != 0
+        || metadata.mode() & libc::S_ISVTX as u32 == 0
+    {
+        return Err(ApError::coded(
+            "AP_INSECURE_PATH",
+            "/private/tmp 必须是 root 拥有的真实 sticky 目录",
+        ));
+    }
+
+    let user_root = path.parent().ok_or_else(|| {
+        ApError::coded(
+            "AP_INSECURE_PATH",
+            "macOS control socket 目录缺少用户级父目录",
+        )
+    })?;
+    ensure_owned_private_component(user_root)?;
+    ensure_owned_private_component(path)
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_owned_private_component(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(ApError::coded(
+            "AP_INSECURE_PATH",
+            format!("{} 必须是当前用户拥有的真实目录", path.display()),
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    let verified = fs::symlink_metadata(path)?;
+    if verified.file_type().is_symlink()
+        || !verified.is_dir()
+        || verified.uid() != unsafe { libc::geteuid() }
+        || verified.mode() & 0o077 != 0
+    {
+        return Err(ApError::coded(
+            "AP_INSECURE_PATH",
+            format!("{} 无法固定为当前用户私有目录", path.display()),
+        ));
+    }
     Ok(())
 }
 
@@ -501,5 +608,76 @@ mod tests {
         symlink(&target, &paths.config_file).unwrap();
         let store = ConfigStore::new(paths);
         assert_eq!(store.load().unwrap_err().code(), "AP_INSECURE_PATH");
+    }
+
+    #[test]
+    fn control_socket_names_are_stable_or_unique_as_required() {
+        let paths = AppPaths::from_root("/tmp/ap-control-test");
+        let id = Uuid::new_v4();
+        assert_eq!(
+            paths.profile_control_socket(id),
+            paths.profile_control_socket(id)
+        );
+        assert_ne!(paths.doctor_control_socket(), paths.doctor_control_socket());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_control_paths_leave_openssh_temporary_headroom() {
+        const MACOS_SUN_PATH_BYTES: usize = 104;
+        const OPENSSH_TEMPORARY_SUFFIX_HEADROOM: usize = 24;
+
+        let mut paths = AppPaths::from_root("/unused");
+        paths.control_dir = macos_control_dir();
+        let profile = paths.profile_control_socket(Uuid::nil());
+        let doctor = paths.doctor_control_socket();
+        for path in [profile, doctor] {
+            assert!(
+                path.as_os_str().as_encoded_bytes().len() + OPENSSH_TEMPORARY_SUFFIX_HEADROOM
+                    < MACOS_SUN_PATH_BYTES,
+                "{} leaves insufficient sockaddr_un headroom",
+                path.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_private_runtime_component_rejects_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = temp.path().join("link");
+        symlink(&target, &link).unwrap();
+        assert_eq!(
+            ensure_owned_private_component(&link).unwrap_err().code(),
+            "AP_INSECURE_PATH"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_private_runtime_component_normalizes_permissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("runtime");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+        ensure_owned_private_component(&directory).unwrap();
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_system_tmp_is_a_root_owned_sticky_directory() {
+        let metadata = fs::symlink_metadata("/private/tmp").unwrap();
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), 0);
+        assert_ne!(metadata.mode() & libc::S_ISVTX as u32, 0);
     }
 }
