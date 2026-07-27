@@ -27,7 +27,7 @@ Rust 1.88 or later and the system OpenSSH client are required.
 
 ### Configure
 
-`ap` reads one manually maintained configuration file:
+`ap` reads one manually maintained TOML configuration file:
 
 ```text
 ${XDG_CONFIG_HOME:-$HOME/.config}/ap/config.toml
@@ -46,26 +46,35 @@ A minimal configuration using an SSH key is:
 ```toml
 version = 2
 
-[connections.dev.ssh]
+[connections.my-server.ssh]
 host = "server.example.com"
 port = 22
 user = "alice"
 identity_file = "/absolute/path/to/id_ed25519"
 
-[[connections.dev.proxies]]
+[[connections.my-server.proxies]]
 protocol = "mixed"
 local = "127.0.0.1:7890"
 remote_port = 17890
 ```
 
-- `host`, `port`, and `user` are direct SSH destination values. SSH config aliases are not supported.
-- `identity_file` must be an absolute path to a private key that can be used without interaction.
-- Omit `identity_file` to use SSH password authentication. `ap` then reads the password without echo from `/dev/tty`; it has no password option and does not store the password.
-- `protocol` can be `http`, `socks5`, or `mixed`.
-- `local` must use `127.0.0.1` or `::1`.
-- `remote_port` must be between 1024 and 65535 and is always bound to remote `127.0.0.1`.
-- Add another `[[connections.dev.proxies]]` block to expose another local proxy.
-- TOML paths must be absolute. `~` and environment variables are not expanded inside the file.
+All supported configuration fields are:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `version` | Yes | Configuration format version. It must be `2`. |
+| `connections.<name>` | Yes | A connection table. The name is user-defined, must start with an ASCII letter or digit, may contain `.`, `_`, or `-`, and is limited to 64 bytes. |
+| `connections.<name>.ssh.host` | Yes | Direct SSH DNS name or unbracketed IP address. SSH config aliases are not supported. |
+| `connections.<name>.ssh.port` | Yes | SSH port from `1` to `65535`. |
+| `connections.<name>.ssh.user` | Yes | SSH login user. It may contain ASCII letters, digits, `.`, `_`, or `-`, and is limited to 64 bytes. |
+| `connections.<name>.ssh.identity_file` | No | Absolute private-key path. When omitted, `ap` prompts for an SSH password without storing it. |
+| `connections.<name>.ssh.connect_timeout_seconds` | No | SSH connection timeout from `1` to `300` seconds. The default is `15`. |
+| `connections.<name>.proxies` | Yes | One or more proxy mappings, each declared with `[[connections.<name>.proxies]]`. |
+| `connections.<name>.proxies[].protocol` | Yes | Local proxy protocol: `http`, `socks5`, or `mixed`. |
+| `connections.<name>.proxies[].local` | Yes | Local proxy endpoint. It must use `127.0.0.1` or `::1` and a nonzero port. |
+| `connections.<name>.proxies[].remote_port` | Yes | Remote loopback port from `1024` to `65535`; it must be unique within the connection. |
+
+Unknown fields are rejected. TOML paths must be absolute; `~` and environment variables are not expanded. The configuration and identity files must be regular files owned by the current user. The configuration must not be writable by group or other users, and an identity file must not be accessible by them.
 
 See [config.example.toml](config.example.toml) for key and password examples.
 
@@ -74,23 +83,23 @@ See [config.example.toml](config.example.toml) for key and password examples.
 Check the local proxy, host key, SSH authentication, reverse-forwarding policy, and remote port availability:
 
 ```bash
-ap dev -d
+ap my-server -d
 ```
 
 Diagnostics do not test the remote host's Internet or DNS access and do not modify the remote host.
 
 ### Connect
 
-Start `dev` in the background:
+Start `my-server` in the background:
 
 ```bash
-ap dev
+ap my-server
 ```
 
 Run it in the foreground instead:
 
 ```bash
-ap dev -f
+ap my-server -f
 ```
 
 After the tunnel is ready, `ap` prints proxy environment variables similar to:
@@ -103,14 +112,14 @@ export all_proxy='socks5h://ap:<generated-secret>@127.0.0.1:17890'
 
 Copy the actual output to the remote user's shell. `ap` never changes the remote environment or files itself.
 
-Running `ap dev` again while `dev` is active only prints its current status and environment variables. It does not reload the configuration or rotate credentials.
+Running `ap my-server` again while `my-server` is active only prints its current status and environment variables. It does not reload the configuration or rotate credentials.
 
 ### Manage connections
 
 ```bash
-ap dev -r   # Restart dev with the latest configuration
+ap my-server -r   # Restart my-server with the latest configuration
 ap -r       # Restart all active connections
-ap dev -c   # Close dev
+ap my-server -c   # Close my-server
 ap -c       # Close all active connections
 ap -l       # List active connections
 ap -h       # Show help
@@ -119,4 +128,4 @@ ap -v       # Show the version
 
 Configuration edits affect only later starts or explicit restarts. Every explicit start or restart creates new proxy credentials, so previously printed environment variables become invalid.
 
-Key-authenticated connections reconnect automatically after network loss while keeping the same configuration snapshot and proxy credentials. Password-authenticated connections do not retain the SSH password; after a disconnect, run `ap dev` again and enter the password again.
+Key-authenticated connections reconnect automatically after network loss while keeping the same configuration snapshot and proxy credentials. Password-authenticated connections do not retain the SSH password; after a disconnect, run `ap my-server` again and enter the password again.

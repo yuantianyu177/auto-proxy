@@ -7,14 +7,13 @@
 version = 2
 
 # Key authentication.
-[connections.dev.ssh]
-host = "dev.example.com"
+[connections.my-server.ssh]
+host = "server.example.com"
 port = 22
 user = "alice"
-connect_timeout_seconds = 15
 identity_file = "/home/alice/.ssh/id_ed25519"
 
-[[connections.dev.proxies]]
+[[connections.my-server.proxies]]
 protocol = "mixed"
 local = "127.0.0.1:7890"
 remote_port = 17890
@@ -23,12 +22,12 @@ remote_port = 17890
 # without echo from /dev/tty on every explicit start or restart. The password
 # is cleared immediately after the first authentication attempt. Password
 # connections end instead of reconnecting after SSH disconnects.
-[connections.password-dev.ssh]
+[connections.password-server.ssh]
 host = "password.example.com"
 port = 2222
 user = "alice"
 
-[[connections.password-dev.proxies]]
+[[connections.password-server.proxies]]
 protocol = "socks5"
 local = "[::1]:7891"
 remote_port = 17891
