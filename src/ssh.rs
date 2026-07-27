@@ -1283,7 +1283,9 @@ fn sanitize_text(text: &str) -> String {
 
 fn ssh_exit_error(code: Option<i32>, raw_stderr: &str) -> ApError {
     let lowercase = raw_stderr.to_ascii_lowercase();
-    let error_code = if lowercase.contains("permission denied") {
+    let error_code = if lowercase.contains("permission denied")
+        || lowercase.contains("too many authentication failures")
+    {
         "AP_SSH_AUTH_FAILED"
     } else if lowercase.contains("controlpath too long")
         || lowercase.contains("unix_listener") && lowercase.contains("too long")
@@ -1581,6 +1583,19 @@ mod tests {
         );
         assert_eq!(error.code(), "AP_SSH_CONTROL_PATH_TOO_LONG");
         assert!(!error.to_string().contains("/Users/"));
+    }
+
+    #[test]
+    fn classifies_openssh_authentication_failures() {
+        for diagnostic in [
+            "Permission denied (publickey,password).",
+            "Received disconnect: Too many authentication failures",
+        ] {
+            assert_eq!(
+                ssh_exit_error(Some(255), diagnostic).code(),
+                "AP_SSH_AUTH_FAILED"
+            );
+        }
     }
 
     #[test]
