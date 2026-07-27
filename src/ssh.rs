@@ -23,7 +23,7 @@ use crate::error::{ApError, Result};
 use crate::model::is_supported_loopback;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, Command};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, timeout};
 
@@ -423,10 +423,9 @@ pub fn build_master_args(options: &SshOptions) -> Result<Vec<OsString>> {
     args.push(options.target.port.to_string().into());
     args.push("-l".into());
     args.push(options.target.user.clone().into());
-    for forward in &options.forwards {
-        args.push("-R".into());
-        args.push(format_forward(forward).into());
-    }
+    // Remote forwards are requested synchronously after the multiplex master
+    // is ready. A responsive control socket alone does not prove that initial
+    // `-R` requests have received their server replies.
     args.push("--".into());
     args.push(options.target.host.clone().into());
     Ok(args)
@@ -813,13 +812,14 @@ impl From<&SshOptions> for SshControlOptions {
 }
 
 impl SshMaster {
-    /// Start OpenSSH and wait until its multiplex control socket answers. With
-    /// `ExitOnForwardFailure=yes`, this means all requested `-R` listeners have
-    /// been established.
+    /// Start OpenSSH, wait for its multiplex control socket, then synchronously
+    /// request every remote forward through that master. Returning success
+    /// therefore means the server has acknowledged every requested listener.
     pub async fn start(mut options: SshOptions) -> Result<Self> {
         options.executable = validate_ssh_executable(&options.executable)?;
         options.validate()?;
         let control = SshControlOptions::from(&options);
+        let forwards = options.forwards.clone();
         let startup_timeout = options.startup_timeout;
         prepare_control_parent(&options.control_socket)?;
         if options.control_socket.exists() {
@@ -938,24 +938,11 @@ impl SshMaster {
                 "The ap code identity changed before SSH startup; restart ap with a trusted executable",
             ));
         }
-        let stderr = Arc::new(Mutex::new(BoundedStderr::default()));
-        let mut stderr_pipe = child
+        let stderr_pipe = child
             .stderr
             .take()
             .ok_or_else(|| ApError::coded("AP_SSH_STDERR", "failed to capture SSH stderr"))?;
-        let stderr_for_task = Arc::clone(&stderr);
-        let stderr_task = tokio::spawn(async move {
-            let mut buffer = [0_u8; 4096];
-            loop {
-                match stderr_pipe.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => stderr_for_task
-                        .lock()
-                        .expect("stderr buffer poisoned")
-                        .push(&buffer[..read]),
-                }
-            }
-        });
+        let (stderr, stderr_task) = capture_stderr(stderr_pipe);
 
         let ssh_pid = match read_watchdog_report(&mut child, startup_timeout).await {
             Ok(pid) => pid,
@@ -1015,6 +1002,17 @@ impl SshMaster {
                     return Err(error);
                 }
 
+                if let Err(error) = request_remote_forwards(&control, &forwards, deadline).await {
+                    stop_watchdog_after_start_failure(
+                        &mut child,
+                        &mut watchdog_liveness,
+                        Some((ssh_pid, ssh_own_process_group)),
+                    )
+                    .await;
+                    stderr_task.abort();
+                    return Err(error);
+                }
+
                 return Ok(Self {
                     child,
                     ssh_pid,
@@ -1036,10 +1034,7 @@ impl SshMaster {
                     broker.abort();
                 }
                 stderr_task.abort();
-                return Err(ApError::coded(
-                    "AP_SSH_START_TIMEOUT",
-                    "timed out waiting for OpenSSH ControlMaster",
-                ));
+                return Err(ssh_start_timeout_error());
             }
             sleep(Duration::from_millis(100)).await;
         }
@@ -1142,12 +1137,66 @@ async fn control_exit(options: &SshControlOptions) -> bool {
         .is_ok_and(|status| status.is_ok_and(|status| status.success()))
 }
 
+async fn request_remote_forwards(
+    options: &SshControlOptions,
+    forwards: &[RemoteForward],
+    deadline: Instant,
+) -> Result<()> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ssh_start_timeout_error());
+    }
+
+    let mut command = control_forward_command(options, forwards);
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stderr_pipe = child.stderr.take().ok_or_else(|| {
+        ApError::coded("AP_SSH_STDERR", "failed to capture SSH forwarding stderr")
+    })?;
+    let (stderr, stderr_task) = capture_stderr(stderr_pipe);
+
+    let status = match timeout(remaining, child.wait()).await {
+        Ok(status) => status?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return Err(ssh_start_timeout_error());
+        }
+    };
+    let _ = stderr_task.await;
+    if status.success() {
+        return Ok(());
+    }
+
+    let stderr = stderr.lock().expect("stderr buffer poisoned");
+    Err(ssh_exit_error(status.code(), &stderr.raw_text()))
+}
+
+fn ssh_start_timeout_error() -> ApError {
+    ApError::coded(
+        "AP_SSH_START_TIMEOUT",
+        "timed out establishing the SSH connection and remote forwardings",
+    )
+}
+
 fn control_command(options: &SshControlOptions, operation: &str) -> Command {
     control_command_for(
         &options.executable,
         &options.control_socket,
         &options.target,
         operation,
+        &[],
+    )
+}
+
+fn control_forward_command(options: &SshControlOptions, forwards: &[RemoteForward]) -> Command {
+    control_command_for(
+        &options.executable,
+        &options.control_socket,
+        &options.target,
+        "forward",
+        forwards,
     )
 }
 
@@ -1156,6 +1205,7 @@ fn control_command_for(
     control_socket: &Path,
     target: &SshTarget,
     operation: &str,
+    forwards: &[RemoteForward],
 ) -> Command {
     let mut command = Command::new(executable);
     command
@@ -1174,11 +1224,17 @@ fn control_command_for(
         .arg("-o")
         .arg("GlobalKnownHostsFile=/dev/null")
         .arg("-o")
-        .arg("CanonicalizeHostname=no")
+        .arg("CanonicalizeHostname=no");
+    for forward in forwards {
+        command.arg("-R").arg(format_forward(forward));
+    }
+    command
         .arg("--")
         .arg(&target.host)
         .env("LC_ALL", "C")
+        .env_remove("SSH_AUTH_SOCK")
         .env_remove("SSH_ASKPASS")
+        .env_remove("SSH_ASKPASS_REQUIRE")
         .env_remove("AP_ASKPASS_MODE")
         .env_remove("AP_ASKPASS_SOCKET")
         .env_remove("AP_ASKPASS_NONCE")
@@ -1188,6 +1244,24 @@ fn control_command_for(
         .kill_on_drop(true);
     remove_loader_environment(&mut command);
     command
+}
+
+fn capture_stderr(mut pipe: ChildStderr) -> (Arc<Mutex<BoundedStderr>>, JoinHandle<()>) {
+    let stderr = Arc::new(Mutex::new(BoundedStderr::default()));
+    let stderr_for_task = Arc::clone(&stderr);
+    let task = tokio::spawn(async move {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match pipe.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => stderr_for_task
+                    .lock()
+                    .expect("stderr buffer poisoned")
+                    .push(&buffer[..read]),
+            }
+        }
+    });
+    (stderr, task)
 }
 
 fn prepare_control_parent(control_socket: &Path) -> Result<()> {
@@ -1292,6 +1366,8 @@ fn ssh_exit_error(code: Option<i32>, raw_stderr: &str) -> ApError {
     {
         "AP_SSH_CONTROL_PATH_TOO_LONG"
     } else if lowercase.contains("remote port forwarding failed")
+        || lowercase.contains("forwarding request failed")
+        || lowercase.contains("master refused forwarding request")
         || lowercase.contains("cannot listen to port")
     {
         "AP_SSH_FORWARD_FAILED"
@@ -1407,12 +1483,36 @@ mod tests {
     }
 
     #[test]
-    fn forward_is_bound_to_remote_loopback() {
-        let args = build_master_args(&key_options()).unwrap();
+    fn remote_forwards_are_synchronously_requested_through_the_master() {
+        let mut options = key_options();
+        options.forwards.push(RemoteForward {
+            remote_port: 17891,
+            local_gateway: "[::1]:43124".parse().unwrap(),
+        });
+
+        let master_args = build_master_args(&options).unwrap();
+        assert!(!master_args.iter().any(|arg| arg == "-R"));
         assert!(
-            args.iter()
-                .any(|arg| { arg.to_string_lossy() == "127.0.0.1:17890:127.0.0.1:43123" })
+            !master_args
+                .iter()
+                .any(|arg| arg.to_string_lossy().contains("17890"))
         );
+
+        let control = SshControlOptions::from(&options);
+        let command = control_forward_command(&control, &options.forwards);
+        let rendered = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(rendered.starts_with("-F /dev/null "));
+        assert!(rendered.contains("-O forward"));
+        assert!(rendered.contains("-R 127.0.0.1:17890:127.0.0.1:43123"));
+        assert!(rendered.contains("-R 127.0.0.1:17891:[::1]:43124"));
+        assert!(rendered.ends_with("-- example.invalid"));
+        assert!(!rendered.contains("PreferredAuthentications"));
+        assert!(!rendered.contains("IdentityFile"));
     }
 
     #[test]
@@ -1594,6 +1694,19 @@ mod tests {
             assert_eq!(
                 ssh_exit_error(Some(255), diagnostic).code(),
                 "AP_SSH_AUTH_FAILED"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_mux_forward_failures() {
+        for diagnostic in [
+            "mux_client_forward: forwarding request failed: remote port forwarding failed for listen port 17890",
+            "Master refused forwarding request",
+        ] {
+            assert_eq!(
+                ssh_exit_error(Some(255), diagnostic).code(),
+                "AP_SSH_FORWARD_FAILED"
             );
         }
     }
