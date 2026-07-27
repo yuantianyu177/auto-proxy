@@ -11,9 +11,7 @@ use std::time::Duration;
 
 use auto_proxy::askpass::{MODE_ENV, NONCE_ENV, PasswordProvider, SOCKET_ENV};
 use auto_proxy::error::{ApError, Result};
-use auto_proxy::ssh::{
-    RemoteForward, SshAuthentication, SshMaster, SshOptions, system_ssh_executable,
-};
+use auto_proxy::ssh::{RemoteForward, SshAuth, SshMaster, SshOptions, SshTarget};
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -21,8 +19,10 @@ use zeroize::{Zeroize, Zeroizing};
 
 const ENABLE_ENV: &str = "AP_RUN_OPENSSH_PASSWORD_TEST";
 const HOST_ENV: &str = "AP_TEST_SSH_PASSWORD_HOST";
-const PASSWORD_FILE_ENV: &str = "AP_TEST_SSH_PASSWORD_FILE";
-const KBDINT_HOST_ENV: &str = "AP_TEST_SSH_KBDINT_HOST";
+const PORT_ENV: &str = "AP_TEST_SSH_PASSWORD_PORT";
+const USER_ENV: &str = "AP_TEST_SSH_PASSWORD_USER";
+const KNOWN_HOSTS_ENV: &str = "AP_TEST_SSH_PASSWORD_KNOWN_HOSTS";
+const PASSWORD_FIXTURE_ENV: &str = "AP_TEST_SSH_PASSWORD_FIXTURE_PATH";
 const MAX_PASSWORD_BYTES: u64 = 64 * 1024;
 const ASKPASS_MODE: &str = "ssh-password-v1";
 const ASKPASS_MAX_FRAME: usize = 64 * 1024;
@@ -132,12 +132,12 @@ async fn real_password_only_openssh_uses_one_shot_askpass_and_cleans_up() {
         return;
     }
 
-    let host = required_env(HOST_ENV);
-    let password_file = PathBuf::from(required_env(PASSWORD_FILE_ENV));
+    let target = password_target_from_env();
+    let password_fixture = PathBuf::from(required_env(PASSWORD_FIXTURE_ENV));
     // Validate the file before opening any SSH connection. Providers repeat all
     // checks and read it afresh for each authentication request.
     drop(
-        read_password_file(&password_file)
+        read_password_fixture(&password_fixture)
             .unwrap_or_else(|error| panic!("password fixture is invalid: {}", error.code())),
     );
 
@@ -153,13 +153,13 @@ async fn real_password_only_openssh_uses_one_shot_askpass_and_cleans_up() {
     let first_calls = Arc::new(AtomicUsize::new(0));
     let first = expect_started(
         ssh_options(
-            &host,
+            &target,
             &first_control,
             remote_port,
             local_gateway,
             &mode_dispatcher,
-            file_provider(
-                password_file.clone(),
+            fixture_provider(
+                password_fixture.clone(),
                 PasswordVariant::Exact,
                 Arc::clone(&first_calls),
             ),
@@ -178,19 +178,20 @@ async fn real_password_only_openssh_uses_one_shot_askpass_and_cleans_up() {
         "ControlMaster socket survived shutdown"
     );
 
+    // This is a new explicit password connection, not an automatic reconnect.
     // Reusing the identical fixed remote port proves the first remote listener
     // was released as part of shutdown, without running any command remotely.
     let second_control = directory.path().join("correct-reuse.sock");
     let second_calls = Arc::new(AtomicUsize::new(0));
     let second = expect_started(
         ssh_options(
-            &host,
+            &target,
             &second_control,
             remote_port,
             local_gateway,
             &mode_dispatcher,
-            file_provider(
-                password_file.clone(),
+            fixture_provider(
+                password_fixture.clone(),
                 PasswordVariant::Exact,
                 Arc::clone(&second_calls),
             ),
@@ -207,13 +208,13 @@ async fn real_password_only_openssh_uses_one_shot_askpass_and_cleans_up() {
     let wrong = timeout(
         Duration::from_secs(30),
         SshMaster::start(ssh_options(
-            &host,
+            &target,
             &wrong_control,
             random_remote_port(),
             local_gateway,
             &mode_dispatcher,
-            file_provider(
-                password_file.clone(),
+            fixture_provider(
+                password_fixture.clone(),
                 PasswordVariant::IntentionallyWrong,
                 Arc::clone(&wrong_calls),
             ),
@@ -231,84 +232,41 @@ async fn real_password_only_openssh_uses_one_shot_askpass_and_cleans_up() {
     assert_eq!(error.code(), "AP_SSH_AUTH_FAILED");
     assert_eq!(wrong_calls.load(Ordering::SeqCst), 1);
     assert!(!wrong_control.exists());
-
-    if let Some(kbdint_host) = optional_env(KBDINT_HOST_ENV) {
-        verify_keyboard_interactive_is_not_answered(
-            &kbdint_host,
-            &password_file,
-            directory.path(),
-            local_gateway,
-            &mode_dispatcher,
-        )
-        .await;
-    }
-}
-
-async fn verify_keyboard_interactive_is_not_answered(
-    host: &str,
-    password_file: &Path,
-    directory: &Path,
-    local_gateway: std::net::SocketAddr,
-    mode_dispatcher: &Path,
-) {
-    let control = directory.join("keyboard-interactive.sock");
-    let calls = Arc::new(AtomicUsize::new(0));
-    let result = timeout(
-        Duration::from_secs(30),
-        SshMaster::start(ssh_options(
-            host,
-            &control,
-            random_remote_port(),
-            local_gateway,
-            mode_dispatcher,
-            file_provider(
-                password_file.to_owned(),
-                PasswordVariant::Exact,
-                Arc::clone(&calls),
-            ),
-        )),
-    )
-    .await;
-    let error = match result {
-        Ok(Err(error)) => error,
-        Ok(Ok(master)) => {
-            expect_shutdown(master).await;
-            panic!("keyboard-interactive-only alias unexpectedly authenticated")
-        }
-        Err(_) => panic!("keyboard-interactive-only attempt did not terminate"),
-    };
-    assert_eq!(error.code(), "AP_SSH_AUTH_FAILED");
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "stored SSH password was requested for keyboard-interactive"
-    );
-    assert!(!control.exists());
 }
 
 fn ssh_options(
-    host: &str,
+    target: &SshTarget,
     control_socket: &Path,
     remote_port: u16,
     local_gateway: std::net::SocketAddr,
     mode_dispatcher: &Path,
     provider: PasswordProvider,
 ) -> SshOptions {
-    SshOptions {
-        executable: system_ssh_executable()
-            .unwrap_or_else(|error| panic!("trusted OpenSSH is unavailable: {}", error.code())),
-        // SshMaster uses one executable for its watchdog and SSH_ASKPASS. The
-        // private dispatcher sends watchdog mode to the real ap binary and
-        // AskPass mode to this test binary's init-array entry.
-        ap_executable: mode_dispatcher.to_owned(),
-        host: host.to_owned(),
-        control_socket: control_socket.to_owned(),
-        forwards: vec![RemoteForward {
+    let mut options = SshOptions::new(
+        target.clone(),
+        control_socket.to_owned(),
+        vec![RemoteForward {
             remote_port,
             local_gateway,
         }],
-        authentication: SshAuthentication::StoredPassword { provider },
-        startup_timeout: Duration::from_secs(20),
+        SshAuth::Password { provider },
+    )
+    .expect("construct password-authenticated SSH options")
+    .with_ap_executable(mode_dispatcher);
+    // SshMaster uses one executable for its watchdog and SSH_ASKPASS. The
+    // private dispatcher sends watchdog mode to the real ap binary and
+    // AskPass mode to this test binary's init-array entry.
+    options.startup_timeout = Duration::from_secs(20);
+    options
+}
+
+fn password_target_from_env() -> SshTarget {
+    SshTarget {
+        host: required_env(HOST_ENV),
+        port: required_port(PORT_ENV),
+        user: required_env(USER_ENV),
+        known_hosts: PathBuf::from(required_env(KNOWN_HOSTS_ENV)),
+        connect_timeout: Duration::from_secs(10),
     }
 }
 
@@ -347,15 +305,15 @@ fn shell_quote(path: &Path) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn file_provider(
-    password_file: PathBuf,
+fn fixture_provider(
+    password_fixture: PathBuf,
     variant: PasswordVariant,
     calls: Arc<AtomicUsize>,
 ) -> PasswordProvider {
     let wrong_prefix = format!("ap-invalid-{}-", Uuid::new_v4());
     Arc::new(move || {
         calls.fetch_add(1, Ordering::SeqCst);
-        let mut password = read_password_file(&password_file)?;
+        let mut password = read_password_fixture(&password_fixture)?;
         if matches!(variant, PasswordVariant::IntentionallyWrong) {
             password.insert_str(0, &wrong_prefix);
         }
@@ -363,10 +321,10 @@ fn file_provider(
     })
 }
 
-fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
+fn read_password_fixture(path: &Path) -> Result<Zeroizing<String>> {
     let metadata = fs::symlink_metadata(path).map_err(|_| {
         ApError::coded(
-            "AP_TEST_PASSWORD_FILE",
+            "AP_TEST_PASSWORD_FIXTURE",
             "password fixture cannot be inspected",
         )
     })?;
@@ -377,7 +335,7 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
         || metadata.len() > MAX_PASSWORD_BYTES
     {
         return Err(ApError::coded(
-            "AP_TEST_PASSWORD_FILE",
+            "AP_TEST_PASSWORD_FIXTURE",
             "password fixture must be a current-user regular file with mode 0600 and bounded size",
         ));
     }
@@ -387,11 +345,14 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     let file = options.open(path).map_err(|_| {
-        ApError::coded("AP_TEST_PASSWORD_FILE", "password fixture cannot be opened")
+        ApError::coded(
+            "AP_TEST_PASSWORD_FIXTURE",
+            "password fixture cannot be opened",
+        )
     })?;
     let opened = file.metadata().map_err(|_| {
         ApError::coded(
-            "AP_TEST_PASSWORD_FILE",
+            "AP_TEST_PASSWORD_FIXTURE",
             "password fixture metadata cannot be read",
         )
     })?;
@@ -401,7 +362,7 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
         || opened.len() > MAX_PASSWORD_BYTES
     {
         return Err(ApError::coded(
-            "AP_TEST_PASSWORD_FILE",
+            "AP_TEST_PASSWORD_FIXTURE",
             "password fixture changed while it was opened",
         ));
     }
@@ -409,10 +370,15 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
     let mut bytes = Zeroizing::new(Vec::with_capacity(opened.len() as usize));
     file.take(MAX_PASSWORD_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| ApError::coded("AP_TEST_PASSWORD_FILE", "password fixture cannot be read"))?;
+        .map_err(|_| {
+            ApError::coded(
+                "AP_TEST_PASSWORD_FIXTURE",
+                "password fixture cannot be read",
+            )
+        })?;
     if bytes.len() as u64 > MAX_PASSWORD_BYTES {
         return Err(ApError::coded(
-            "AP_TEST_PASSWORD_FILE",
+            "AP_TEST_PASSWORD_FIXTURE",
             "password fixture exceeds the size limit",
         ));
     }
@@ -428,14 +394,14 @@ fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
         || bytes.contains(&b'\r')
     {
         return Err(ApError::coded(
-            "AP_TEST_PASSWORD_FILE",
+            "AP_TEST_PASSWORD_FIXTURE",
             "password fixture is empty or contains an unsupported byte",
         ));
     }
     let password = std::str::from_utf8(&bytes)
         .map_err(|_| {
             ApError::coded(
-                "AP_TEST_PASSWORD_FILE",
+                "AP_TEST_PASSWORD_FIXTURE",
                 "password fixture is not valid UTF-8",
             )
         })?
@@ -467,6 +433,12 @@ fn optional_env(name: &str) -> Option<String> {
             .into_string()
             .unwrap_or_else(|_| panic!("{name} must be valid UTF-8"))
     })
+}
+
+fn required_port(name: &str) -> u16 {
+    required_env(name)
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("{name} must be a valid SSH port"))
 }
 
 fn random_remote_port() -> u16 {

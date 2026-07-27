@@ -6,7 +6,7 @@ use std::fs;
 use std::io::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::os::unix::process::CommandExt as _;
@@ -15,21 +15,19 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep, timeout};
-use zeroize::Zeroizing;
-
 #[cfg(target_os = "macos")]
 use crate::askpass::process_code_matches_current;
 use crate::askpass::{AskpassBroker, PasswordProvider};
 use crate::config::ensure_control_dir;
 use crate::error::{ApError, Result};
+use crate::model::is_supported_loopback;
+use tokio::io::AsyncReadExt;
+use tokio::net::UnixStream;
+use tokio::process::{Child, Command};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep, timeout};
 
 const STDERR_LIMIT: usize = 64 * 1024;
-const CONFIG_INSPECTION_TIMEOUT: Duration = Duration::from_secs(10);
 const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 // OpenSSH first binds a temporary multiplex socket by appending a suffix to
 // ControlPath. Keep enough headroom for that suffix instead of accepting a
@@ -45,7 +43,6 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = 103;
 #[cfg(target_os = "linux")]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 const MAX_ASKPASS_SOCKET_FILE_BYTES: usize = 44;
-const ANONYMOUS_CONFIG_PATH: &str = "/dev/stdin";
 const WATCHDOG_MODE_ENV: &str = "AP_SSH_WATCHDOG_MODE";
 const WATCHDOG_MODE_VALUE: &str = "ssh-parent-v1";
 const WATCHDOG_PROCESS_GROUP_ENV: &str = "AP_SSH_WATCHDOG_PROCESS_GROUP";
@@ -54,8 +51,8 @@ const WATCHDOG_REPORT_SIZE: usize = 5;
 const WATCHDOG_TERM_GRACE: Duration = Duration::from_secs(3);
 
 /// Resolve the system OpenSSH client to a canonical, root-owned executable in
-/// a directory tree that an unprivileged user cannot replace. Stored-password
-/// mode must never trust an arbitrary `ssh` found first in `PATH`, because that
+/// a directory tree that an unprivileged user cannot replace. Password mode
+/// must never trust an arbitrary `ssh` found first in `PATH`, because that
 /// process is the parent authorized to invoke the one-shot AskPass helper.
 pub fn system_ssh_executable() -> Result<PathBuf> {
     let mut candidates = vec![PathBuf::from("/usr/bin/ssh"), PathBuf::from("/bin/ssh")];
@@ -81,9 +78,9 @@ pub fn system_ssh_executable() -> Result<PathBuf> {
             "AP_OPENSSH_UNAVAILABLE"
         },
         if found_untrusted {
-            "找到 ssh，但其文件或父目录可由非 root 用户替换；拒绝将系统凭据交给该进程"
+            "The ssh executable or one of its parent directories is writable by a non-root user"
         } else {
-            "未找到受信任的系统 OpenSSH 客户端"
+            "No trusted system OpenSSH client was found"
         },
     ))
 }
@@ -111,7 +108,7 @@ fn validate_ssh_executable(path: &Path) -> Result<PathBuf> {
     trusted_ssh_path(path).map_err(|()| {
         ApError::coded(
             "AP_OPENSSH_UNTRUSTED",
-            "OpenSSH executable 必须是位于不可由普通用户替换目录中的 root-owned 文件",
+            "OpenSSH must be a root-owned executable in a directory tree that is not writable by unprivileged users",
         )
     })
 }
@@ -122,24 +119,89 @@ pub struct RemoteForward {
     pub local_gateway: SocketAddr,
 }
 
-#[derive(Clone)]
-pub enum SshAuthentication {
-    /// Use the user's SSH config, keys, agent, hardware token, or terminal
-    /// prompt. Background callers should set `batch_mode` to avoid hanging.
-    SshConfig { batch_mode: bool },
-    /// Force the standard SSH password method and obtain its sole password via
-    /// the one-shot AskPass bridge.
-    StoredPassword { provider: PasswordProvider },
+/// An explicit SSH destination. OpenSSH is always invoked with
+/// `-F /dev/null`, so `host` is a destination and never an SSH config alias.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshTarget {
+    pub host: String,
+    pub user: String,
+    pub port: u16,
+    pub known_hosts: PathBuf,
+    pub connect_timeout: Duration,
 }
 
-impl fmt::Debug for SshAuthentication {
+impl SshTarget {
+    pub fn validate(&self) -> Result<()> {
+        validate_destination_field("host", &self.host)?;
+        validate_destination_field("user", &self.user)?;
+        if self.port == 0 {
+            return Err(ApError::coded(
+                "AP_INVALID_SSH_PORT",
+                "SSH port must be between 1 and 65535",
+            ));
+        }
+        if !self.known_hosts.is_absolute() {
+            return Err(ApError::coded(
+                "AP_INVALID_KNOWN_HOSTS",
+                "known_hosts must be an absolute path",
+            ));
+        }
+        let known_hosts = self.known_hosts.as_os_str().as_bytes();
+        if known_hosts.contains(&b'%') || known_hosts.contains(&0) {
+            return Err(ApError::coded(
+                "AP_INVALID_KNOWN_HOSTS",
+                "known_hosts must not contain NUL or OpenSSH percent tokens",
+            ));
+        }
+        if self.connect_timeout.is_zero()
+            || self.connect_timeout > Duration::from_secs(u32::MAX.into())
+        {
+            return Err(ApError::coded(
+                "AP_INVALID_CONNECT_TIMEOUT",
+                "SSH connect timeout must be between 1 and 4294967295 seconds",
+            ));
+        }
+        Ok(())
+    }
+
+    fn connect_timeout_seconds(&self) -> u64 {
+        self.connect_timeout.as_secs().max(1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostKeyPolicy {
+    /// Require an existing matching key in the AP-owned known_hosts file.
+    #[default]
+    Strict,
+    /// Add a previously unseen key, but still reject a changed key.
+    AcceptNew,
+}
+
+impl HostKeyPolicy {
+    fn openssh_value(self) -> &'static str {
+        match self {
+            Self::Strict => "yes",
+            Self::AcceptNew => "accept-new",
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum SshAuth {
+    /// Offer exactly this private key. Interactive private-key passphrases are
+    /// not supported.
+    Key { identity_file: PathBuf },
+    /// Force the standard SSH password method and obtain its sole password via
+    /// the one-shot AskPass bridge.
+    Password { provider: PasswordProvider },
+}
+
+impl fmt::Debug for SshAuth {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SshConfig { batch_mode } => formatter
-                .debug_struct("SshConfig")
-                .field("batch_mode", batch_mode)
-                .finish(),
-            Self::StoredPassword { .. } => formatter.write_str("StoredPassword(<redacted>)"),
+            Self::Key { .. } => formatter.write_str("Key(<configured>)"),
+            Self::Password { .. } => formatter.write_str("Password(<redacted>)"),
         }
     }
 }
@@ -148,51 +210,58 @@ impl fmt::Debug for SshAuthentication {
 pub struct SshOptions {
     pub executable: PathBuf,
     pub ap_executable: PathBuf,
-    pub host: String,
+    pub target: SshTarget,
     pub control_socket: PathBuf,
     pub forwards: Vec<RemoteForward>,
-    pub authentication: SshAuthentication,
+    pub auth: SshAuth,
+    pub host_key_policy: HostKeyPolicy,
     pub startup_timeout: Duration,
 }
 
 impl SshOptions {
     pub fn new(
-        host: impl Into<String>,
+        target: SshTarget,
         control_socket: PathBuf,
         forwards: Vec<RemoteForward>,
-        authentication: SshAuthentication,
+        auth: SshAuth,
     ) -> Result<Self> {
         let ap_executable = std::env::current_exe()?;
         Ok(Self {
             executable: system_ssh_executable()?,
             ap_executable,
-            host: host.into(),
+            target,
             control_socket,
             forwards,
-            authentication,
+            auth,
+            host_key_policy: HostKeyPolicy::Strict,
             startup_timeout: Duration::from_secs(15),
         })
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_host_alias(&self.host)?;
+        self.target.validate()?;
+        if let SshAuth::Key { identity_file } = &self.auth
+            && !identity_file.is_absolute()
+        {
+            return Err(ApError::coded(
+                "AP_INVALID_IDENTITY_FILE",
+                "SSH identity file must be an absolute path",
+            ));
+        }
         let control_path_bytes = self.control_socket.as_os_str().as_bytes();
         if control_path_bytes.contains(&b'%') {
             return Err(ApError::coded(
                 "AP_SSH_CONTROL_PATH_TOKEN",
-                "OpenSSH ControlPath 不能包含 `%`，请更换 AP_CONFIG_DIR",
+                "OpenSSH ControlPath must not contain percent tokens",
             ));
         }
         if control_path_bytes.len() > MAX_CONTROL_PATH_BYTES {
             return Err(ApError::coded(
                 "AP_SSH_CONTROL_PATH_TOO_LONG",
-                "OpenSSH ControlPath 过长；请缩短 AP_CONFIG_DIR，或使用平台默认配置目录",
+                "OpenSSH ControlPath is too long for the platform Unix-socket limit",
             ));
         }
-        if matches!(
-            self.authentication,
-            SshAuthentication::StoredPassword { .. }
-        ) {
+        if matches!(self.auth, SshAuth::Password { .. }) {
             let parent = self.control_socket.parent().ok_or_else(|| {
                 ApError::coded(
                     "AP_SSH_CONTROL_PATH",
@@ -207,7 +276,7 @@ impl SshOptions {
             if askpass_path_bytes > MAX_UNIX_SOCKET_PATH_BYTES {
                 return Err(ApError::coded(
                     "AP_ASKPASS_SOCKET_PATH_TOO_LONG",
-                    "AskPass Unix socket 路径过长；请缩短 AP_CONFIG_DIR，或使用平台默认配置目录",
+                    "AskPass socket path is too long for the platform Unix-socket limit",
                 ));
             }
         }
@@ -225,7 +294,7 @@ impl SshOptions {
                     format!("remote port {} is below 1024", forward.remote_port),
                 ));
             }
-            if !forward.local_gateway.ip().is_loopback() {
+            if !is_supported_loopback(forward.local_gateway.ip()) {
                 return Err(ApError::coded(
                     "AP_NON_LOOPBACK_GATEWAY",
                     "local gateway must use a loopback address",
@@ -249,12 +318,19 @@ impl SshOptions {
         self.ap_executable = executable.into();
         self
     }
+
+    pub fn with_host_key_policy(mut self, policy: HostKeyPolicy) -> Self {
+        self.host_key_policy = policy;
+        self
+    }
 }
 
 /// Pure command construction, exposed for security regression tests.
 pub fn build_master_args(options: &SshOptions) -> Result<Vec<OsString>> {
     options.validate()?;
     let mut args = vec![
+        "-F".into(),
+        "/dev/null".into(),
         "-M".into(),
         "-S".into(),
         options.control_socket.as_os_str().to_owned(),
@@ -280,40 +356,118 @@ pub fn build_master_args(options: &SshOptions) -> Result<Vec<OsString>> {
         "PermitLocalCommand=no".into(),
         "-o".into(),
         "Tunnel=no".into(),
+        "-o".into(),
+        "CanonicalizeHostname=no".into(),
+        "-o".into(),
+        "ProxyCommand=none".into(),
+        "-o".into(),
+        "ProxyJump=none".into(),
+        "-o".into(),
+        "KnownHostsCommand=none".into(),
+        "-o".into(),
+        "GlobalKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        format!(
+            "StrictHostKeyChecking={}",
+            options.host_key_policy.openssh_value()
+        )
+        .into(),
+        "-o".into(),
+        format!(
+            "ConnectTimeout={}",
+            options.target.connect_timeout_seconds()
+        )
+        .into(),
     ];
-    match &options.authentication {
-        SshAuthentication::SshConfig { batch_mode } => {
-            args.push("-o".into());
-            args.push(format!("BatchMode={}", if *batch_mode { "yes" } else { "no" }).into());
+    args.push("-o".into());
+    args.push(option_with_path(
+        "UserKnownHostsFile=",
+        &options.target.known_hosts,
+    ));
+    match &options.auth {
+        SshAuth::Key { identity_file } => {
+            push_options(
+                &mut args,
+                &[
+                    "PreferredAuthentications=publickey",
+                    "PubkeyAuthentication=yes",
+                    "PasswordAuthentication=no",
+                    "KbdInteractiveAuthentication=no",
+                    "NumberOfPasswordPrompts=0",
+                    "BatchMode=yes",
+                    "IdentitiesOnly=yes",
+                    "IdentityAgent=none",
+                ],
+            );
+            args.push("-i".into());
+            args.push(identity_file.as_os_str().to_owned());
         }
-        SshAuthentication::StoredPassword { .. } => {
-            for option in [
+        SshAuth::Password { .. } => push_options(
+            &mut args,
+            &[
                 "PreferredAuthentications=password",
                 "PasswordAuthentication=yes",
                 "PubkeyAuthentication=no",
-                "PKCS11Provider=none",
-                "SecurityKeyProvider=internal",
-                "ProxyCommand=none",
-                "ProxyJump=none",
-                "KnownHostsCommand=none",
-                "CanonicalizeHostname=no",
                 "KbdInteractiveAuthentication=no",
                 "NumberOfPasswordPrompts=1",
                 "BatchMode=no",
-                "StrictHostKeyChecking=yes",
-            ] {
-                args.push("-o".into());
-                args.push(option.into());
-            }
-        }
+                "IdentitiesOnly=yes",
+                "IdentityFile=none",
+                "IdentityAgent=none",
+                "PKCS11Provider=none",
+                "SecurityKeyProvider=internal",
+            ],
+        ),
     }
+    args.push("-p".into());
+    args.push(options.target.port.to_string().into());
+    args.push("-l".into());
+    args.push(options.target.user.clone().into());
     for forward in &options.forwards {
         args.push("-R".into());
         args.push(format_forward(forward).into());
     }
     args.push("--".into());
-    args.push(options.host.clone().into());
+    args.push(options.target.host.clone().into());
     Ok(args)
+}
+
+fn push_options(arguments: &mut Vec<OsString>, options: &[&str]) {
+    for option in options {
+        arguments.push("-o".into());
+        arguments.push((*option).into());
+    }
+}
+
+pub(crate) fn option_with_path(prefix: &str, path: &Path) -> OsString {
+    let mut bytes = Vec::with_capacity(prefix.len() + path.as_os_str().as_bytes().len() + 2);
+    bytes.extend_from_slice(prefix.as_bytes());
+    bytes.push(b'"');
+    for byte in path.as_os_str().as_bytes() {
+        if matches!(byte, b'\\' | b'"') {
+            bytes.push(b'\\');
+        }
+        bytes.push(*byte);
+    }
+    bytes.push(b'"');
+    OsString::from_vec(bytes)
+}
+
+fn validate_destination_field(name: &str, value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.starts_with('-')
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return Err(ApError::coded(
+            "AP_INVALID_SSH_TARGET",
+            format!(
+                "SSH {name} must be non-empty, contain no whitespace or control characters, and not start with '-'"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn format_forward(forward: &RemoteForward) -> String {
@@ -526,193 +680,6 @@ async fn terminate_ssh_child(
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ConfigDirective {
-    pub name: String,
-    pub value: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SshConfigInspection {
-    pub hostname: Option<String>,
-    pub user: Option<String>,
-    pub port: Option<u16>,
-    pub disallowed: Vec<ConfigDirective>,
-    pub credential_helpers: Vec<ConfigDirective>,
-}
-
-/// Resolve an alias with OpenSSH itself and reject settings which could add
-/// unaccounted tunnels or execute local/remote commands.
-pub async fn inspect_ssh_config(executable: &Path, host: &str) -> Result<SshConfigInspection> {
-    let (inspection, _effective_config) = load_effective_ssh_config(executable, host).await?;
-    Ok(inspection)
-}
-
-async fn load_effective_ssh_config(
-    executable: &Path,
-    host: &str,
-) -> Result<(SshConfigInspection, Zeroizing<Vec<u8>>)> {
-    validate_host_alias(host)?;
-    let mut command = Command::new(executable);
-    command
-        .arg("-G")
-        .arg("--")
-        .arg(host)
-        .env("LC_ALL", "C")
-        .env_remove("SSH_ASKPASS")
-        .env_remove("AP_ASKPASS_MODE")
-        .env_remove("AP_ASKPASS_SOCKET")
-        .env_remove("AP_ASKPASS_NONCE")
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-    remove_loader_environment(&mut command);
-    let output = timeout(CONFIG_INSPECTION_TIMEOUT, command.output())
-        .await
-        .map_err(|_| {
-            ApError::coded(
-                "AP_SSH_CONFIG_TIMEOUT",
-                "检查 SSH Host alias 超时（请检查 Include 或 Match exec）",
-            )
-        })??;
-    if !output.status.success() {
-        return Err(ApError::coded(
-            "AP_SSH_CONFIG",
-            // `ssh -G` diagnostics can contain resolved host/user values,
-            // Include paths, key paths, or output from config helpers. Keep
-            // daemon/status surfaces bounded and direct the user to an
-            // explicit local diagnostic command instead of reflecting it.
-            "OpenSSH 无法解析专用 Host alias；请在本机运行 `ssh -G -- <alias>` 检查 SSH config",
-        ));
-    }
-
-    let effective_config = Zeroizing::new(output.stdout);
-    let text = String::from_utf8_lossy(effective_config.as_slice());
-    let inspection = parse_ssh_config(&text)?;
-    Ok((inspection, effective_config))
-}
-
-async fn reject_match_exec(executable: &Path, host: &str) -> Result<()> {
-    // `ssh -G` evaluates Include and Match blocks but does not expose the
-    // Match-exec command in its normal output. Debug output does, and this
-    // preflight runs before AP_ASKPASS_* is added to the real SSH child.
-    let mut command = Command::new(executable);
-    command
-        .args(["-vvv", "-G", "--"])
-        .arg(host)
-        .env("LC_ALL", "C")
-        .env_remove("SSH_ASKPASS")
-        .env_remove("AP_ASKPASS_MODE")
-        .env_remove("AP_ASKPASS_SOCKET")
-        .env_remove("AP_ASKPASS_NONCE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .kill_on_drop(true);
-    remove_loader_environment(&mut command);
-    let output = timeout(CONFIG_INSPECTION_TIMEOUT, command.output())
-        .await
-        .map_err(|_| {
-            ApError::coded(
-                "AP_SSH_CONFIG_TIMEOUT",
-                "检查 SSH Host alias 的 Match exec 超时",
-            )
-        })??;
-    if !output.status.success() {
-        return Err(ApError::coded(
-            "AP_SSH_CONFIG",
-            "无法安全检查 SSH Host alias 中的 Match exec",
-        ));
-    }
-    let debug = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    let has_match_exec = debug.lines().any(|line| {
-        line.contains("executing command:")
-            || (line.contains("checking match for '")
-                && (line.contains("'exec ") || line.contains(" exec ")))
-    });
-    if has_match_exec {
-        return Err(ApError::coded(
-            "AP_SSH_STORED_PASSWORD_UNSAFE_ALIAS",
-            "stored-password 不允许 SSH config 使用 Match exec；请建立不执行本地命令的专用 Host alias",
-        ));
-    }
-    Ok(())
-}
-
-fn parse_ssh_config(text: &str) -> Result<SshConfigInspection> {
-    let mut inspection = SshConfigInspection {
-        hostname: None,
-        user: None,
-        port: None,
-        disallowed: Vec::new(),
-        credential_helpers: Vec::new(),
-    };
-    for line in text.lines() {
-        let Some((name, value)) = line.split_once(char::is_whitespace) else {
-            continue;
-        };
-        let name = name.to_ascii_lowercase();
-        let value = value.trim();
-        match name.as_str() {
-            "hostname" => inspection.hostname = Some(value.to_owned()),
-            "user" => inspection.user = Some(value.to_owned()),
-            "port" => inspection.port = value.parse().ok(),
-            "localforward" | "remoteforward" | "dynamicforward" | "remotecommand"
-            | "localcommand"
-                if !value.eq_ignore_ascii_case("none") =>
-            {
-                inspection.disallowed.push(ConfigDirective {
-                    name,
-                    value: "<configured>".to_owned(),
-                });
-            }
-            "proxycommand" | "proxyjump" | "knownhostscommand"
-                if !value.eq_ignore_ascii_case("none") =>
-            {
-                inspection.credential_helpers.push(ConfigDirective {
-                    name,
-                    value: "<configured>".to_owned(),
-                });
-            }
-            _ => {}
-        }
-    }
-    if !inspection.disallowed.is_empty() {
-        let names = inspection
-            .disallowed
-            .iter()
-            .map(|directive| directive.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(ApError::coded(
-            "AP_SSH_UNSAFE_ALIAS",
-            format!(
-                "SSH alias contains disallowed directives ({names}); create a dedicated Host alias"
-            ),
-        ));
-    }
-    Ok(inspection)
-}
-
-/// Send an already validated effective configuration through the anonymous,
-/// read-only side of the child's stdin pipe. OpenSSH reparses that exact byte
-/// stream via `-F /dev/stdin`; there is no user-writable pathname to replace
-/// between validation and use. Closing the writer is required so OpenSSH sees
-/// EOF and can finish parsing.
-async fn write_anonymous_config(child: &mut Child, contents: &[u8]) -> Result<()> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| ApError::coded("AP_SSH_CONFIG_PIPE", "OpenSSH 的匿名配置输入不可用"))?;
-    timeout(CONFIG_INSPECTION_TIMEOUT, async {
-        stdin.write_all(contents).await?;
-        stdin.shutdown().await
-    })
-    .await
-    .map_err(|_| ApError::coded("AP_SSH_CONFIG_TIMEOUT", "向 OpenSSH 传递已验证配置超时"))?
-    .map_err(|_| ApError::coded("AP_SSH_CONFIG_PIPE", "无法向 OpenSSH 传递已验证配置"))?;
-    drop(stdin);
-    Ok(())
-}
-
 fn configure_watchdog_spawn(
     command: &mut Command,
     child_liveness_fd: libc::c_int,
@@ -820,10 +787,29 @@ pub struct SshMaster {
     ssh_pid: u32,
     ssh_own_process_group: bool,
     watchdog_liveness: Option<StdUnixStream>,
-    options: SshOptions,
+    control: SshControlOptions,
     stderr: Arc<Mutex<BoundedStderr>>,
     stderr_task: JoinHandle<()>,
-    askpass: Option<AskpassBroker>,
+}
+
+/// The long-lived subset of [`SshOptions`]. Authentication is deliberately
+/// absent: an established master only needs these values for multiplexed
+/// `check` and `exit` commands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SshControlOptions {
+    executable: PathBuf,
+    control_socket: PathBuf,
+    target: SshTarget,
+}
+
+impl From<&SshOptions> for SshControlOptions {
+    fn from(options: &SshOptions) -> Self {
+        Self {
+            executable: options.executable.clone(),
+            control_socket: options.control_socket.clone(),
+            target: options.target.clone(),
+        }
+    }
 }
 
 impl SshMaster {
@@ -833,9 +819,11 @@ impl SshMaster {
     pub async fn start(mut options: SshOptions) -> Result<Self> {
         options.executable = validate_ssh_executable(&options.executable)?;
         options.validate()?;
+        let control = SshControlOptions::from(&options);
+        let startup_timeout = options.startup_timeout;
         prepare_control_parent(&options.control_socket)?;
         if options.control_socket.exists() {
-            if control_check(&options).await {
+            if control_check(&control).await {
                 return Err(ApError::coded(
                     "AP_SSH_CONTROL_EXISTS",
                     format!(
@@ -847,42 +835,10 @@ impl SshMaster {
             remove_stale_control_socket(&options.control_socket)?;
         }
 
-        let stored_password = matches!(
-            options.authentication,
-            SshAuthentication::StoredPassword { .. }
-        );
-        let (inspection, effective_config) = if stored_password {
-            // This diagnostic preflight runs with no AP_ASKPASS_* values. The
-            // effective config is then captured and supplied to the real SSH
-            // process through an anonymous stdin pipe, closing the check/use
-            // race on mutable Include files and Match blocks.
-            reject_match_exec(&options.executable, &options.host).await?;
-            let (inspection, bytes) =
-                load_effective_ssh_config(&options.executable, &options.host).await?;
-            (inspection, Some(bytes))
-        } else {
-            (
-                inspect_ssh_config(&options.executable, &options.host).await?,
-                None,
-            )
-        };
-        if stored_password && !inspection.credential_helpers.is_empty() {
-            let names = inspection
-                .credential_helpers
-                .iter()
-                .map(|directive| directive.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(ApError::coded(
-                "AP_SSH_STORED_PASSWORD_UNSAFE_ALIAS",
-                format!(
-                    "stored-password 不允许会继承 AskPass 环境的 SSH 配置项（{names}）；请使用不含本地命令的专用 Host alias"
-                ),
-            ));
-        }
-
-        let mut askpass = match &options.authentication {
-            SshAuthentication::StoredPassword { provider } => {
+        #[cfg(target_os = "macos")]
+        let password_auth = matches!(options.auth, SshAuth::Password { .. });
+        let mut askpass = match &options.auth {
+            SshAuth::Password { provider } => {
                 let socket = askpass_socket_path(&options.control_socket)?;
                 Some(
                     AskpassBroker::bind(
@@ -894,21 +850,13 @@ impl SshMaster {
                     .await?,
                 )
             }
-            SshAuthentication::SshConfig { .. } => None,
+            SshAuth::Key { .. } => None,
         };
 
-        let mut args = build_master_args(&options)?;
-        if effective_config.is_some() {
-            args.insert(0, ANONYMOUS_CONFIG_PATH.into());
-            args.insert(0, "-F".into());
-        }
-        let ssh_own_process_group = match &options.authentication {
-            SshAuthentication::StoredPassword { .. } => true,
-            // A background connection has no terminal to preserve. Foreground
-            // ssh-config keeps the caller's process group so OpenSSH can still
-            // read hardware-token and password prompts from the controlling TTY.
-            SshAuthentication::SshConfig { batch_mode } => *batch_mode,
-        };
+        let args = build_master_args(&options)?;
+        // All supported authentication modes are non-interactive. Give SSH a
+        // dedicated process group so shutdown also reaches helper processes.
+        let ssh_own_process_group = true;
         let (parent_liveness, child_liveness) = StdUnixStream::pair()?;
         let mut watchdog_liveness = Some(parent_liveness);
         #[cfg(target_os = "macos")]
@@ -920,13 +868,13 @@ impl SshMaster {
             // value directly from current_exe().
             let current = std::env::current_exe()?;
             let is_self = options.ap_executable == current;
-            if stored_password && !is_self {
+            if password_auth && !is_self {
                 if let Some(broker) = askpass.take() {
                     broker.abort();
                 }
                 return Err(ApError::coded(
                     "AP_EXECUTABLE_IDENTITY_CHANGED",
-                    "macOS stored-password 只允许由当前 ap 二进制直接托管 watchdog/AskPass",
+                    "Password authentication on macOS requires the current ap executable to host watchdog and AskPass",
                 ));
             }
             is_self
@@ -941,28 +889,21 @@ impl SshMaster {
                 if ssh_own_process_group { "1" } else { "0" },
             )
             .env("LC_ALL", "C")
+            .env_remove("SSH_AUTH_SOCK")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // Dropping the parent handle must leave the watchdog alive long
             // enough to observe EOF and reap its OpenSSH child.
             .kill_on_drop(false);
         remove_loader_environment(&mut command);
-        match &options.authentication {
-            SshAuthentication::SshConfig { batch_mode } if !batch_mode => {
-                command.stdin(Stdio::inherit());
-            }
-            SshAuthentication::SshConfig { .. } => {
+        match &options.auth {
+            SshAuth::Key { .. } => {
                 command.stdin(Stdio::null());
             }
-            SshAuthentication::StoredPassword { .. } => {
-                // The pipe's read end becomes fd 0 in the child. `/dev/stdin`
-                // is a root-owned fd indirection on both Linux and macOS, and
-                // the inherited descriptor cannot be replaced through the
-                // filesystem by another process running as this user.
-                command.stdin(Stdio::piped());
-                // ProxyJump internally launches another `ssh` by name. A
-                // fixed system PATH prevents a user-controlled wrapper from
-                // replacing that direct child of the trusted OpenSSH process.
+            SshAuth::Password { .. } => {
+                command.stdin(Stdio::null());
+                // Keep the helper lookup path deterministic even though all
+                // config-driven command hooks are explicitly disabled.
                 command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
                 let environment = askpass.as_ref().expect("created above").environment();
                 for (name, value) in environment.variables(&options.ap_executable) {
@@ -980,6 +921,10 @@ impl SshMaster {
             ssh_own_process_group,
         );
 
+        // The command now owns every non-secret value needed to spawn, while
+        // the one-shot broker owns the sole provider needed during password
+        // authentication. Do not retain the startup options beyond this point.
+        drop(options);
         let mut child = command.spawn()?;
         drop(child_liveness);
         #[cfg(target_os = "macos")]
@@ -990,7 +935,7 @@ impl SshMaster {
             }
             return Err(ApError::coded(
                 "AP_EXECUTABLE_IDENTITY_CHANGED",
-                "ap 可执行文件的 macOS 代码签名身份在 daemon 运行期间发生变化；已拒绝启动 SSH，请重启受信任的 ap 服务",
+                "The ap code identity changed before SSH startup; restart ap with a trusted executable",
             ));
         }
         let stderr = Arc::new(Mutex::new(BoundedStderr::default()));
@@ -1012,7 +957,7 @@ impl SshMaster {
             }
         });
 
-        let ssh_pid = match read_watchdog_report(&mut child, options.startup_timeout).await {
+        let ssh_pid = match read_watchdog_report(&mut child, startup_timeout).await {
             Ok(pid) => pid,
             Err(error) => {
                 stop_watchdog_after_start_failure(&mut child, &mut watchdog_liveness, None).await;
@@ -1029,26 +974,7 @@ impl SshMaster {
             broker.set_ssh_pid(ssh_pid);
         }
 
-        if let Some(contents) = effective_config {
-            if let Err(error) = write_anonymous_config(&mut child, contents.as_slice()).await {
-                stop_watchdog_after_start_failure(
-                    &mut child,
-                    &mut watchdog_liveness,
-                    Some((ssh_pid, ssh_own_process_group)),
-                )
-                .await;
-                if let Some(broker) = askpass.take() {
-                    broker.abort();
-                }
-                stderr_task.abort();
-                return Err(error);
-            }
-            // `Zeroizing` clears the parent copy here. Any unread bytes now
-            // exist only in the kernel pipe buffer owned by the SSH child.
-            drop(contents);
-        }
-
-        let deadline = Instant::now() + options.startup_timeout;
+        let deadline = Instant::now() + startup_timeout;
         loop {
             if askpass.as_ref().is_some_and(AskpassBroker::is_finished) {
                 let broker = askpass.take().expect("checked above");
@@ -1075,16 +1001,28 @@ impl SshMaster {
                 let raw = stderr.raw_text();
                 return Err(ssh_exit_error(status.code(), &raw));
             }
-            if control_check(&options).await {
+            if control_check(&control).await {
+                if let Some(broker) = askpass.take()
+                    && let Err(error) = broker.wait().await
+                {
+                    stop_watchdog_after_start_failure(
+                        &mut child,
+                        &mut watchdog_liveness,
+                        Some((ssh_pid, ssh_own_process_group)),
+                    )
+                    .await;
+                    stderr_task.abort();
+                    return Err(error);
+                }
+
                 return Ok(Self {
                     child,
                     ssh_pid,
                     ssh_own_process_group,
                     watchdog_liveness,
-                    options,
+                    control,
                     stderr,
                     stderr_task,
-                    askpass,
                 });
             }
             if Instant::now() >= deadline {
@@ -1127,7 +1065,7 @@ impl SshMaster {
 
     /// Ask the master to exit, then escalate to SIGTERM and finally kill.
     pub async fn shutdown(mut self) -> Result<()> {
-        let _ = control_exit(&self.options).await;
+        let _ = control_exit(&self.control).await;
         if timeout(WATCHDOG_TERM_GRACE, self.child.wait())
             .await
             .is_err()
@@ -1157,11 +1095,8 @@ impl SshMaster {
             }
         }
         drop(self.watchdog_liveness.take());
-        if let Some(broker) = self.askpass.take() {
-            broker.abort();
-        }
         self.stderr_task.abort();
-        let _ = fs::remove_file(&self.options.control_socket);
+        let _ = fs::remove_file(&self.control.control_socket);
         Ok(())
     }
 }
@@ -1185,15 +1120,12 @@ impl Drop for SshMaster {
             );
         }
         drop(self.watchdog_liveness.take());
-        if let Some(broker) = &self.askpass {
-            broker.abort();
-        }
         self.stderr_task.abort();
-        let _ = fs::remove_file(&self.options.control_socket);
+        let _ = fs::remove_file(&self.control.control_socket);
     }
 }
 
-async fn control_check(options: &SshOptions) -> bool {
+async fn control_check(options: &SshControlOptions) -> bool {
     if !options.control_socket.exists() {
         return false;
     }
@@ -1203,24 +1135,48 @@ async fn control_check(options: &SshOptions) -> bool {
         .is_ok_and(|status| status.is_ok_and(|status| status.success()))
 }
 
-async fn control_exit(options: &SshOptions) -> bool {
+async fn control_exit(options: &SshControlOptions) -> bool {
     let mut command = control_command(options, "exit");
     timeout(CONTROL_COMMAND_TIMEOUT, command.status())
         .await
         .is_ok_and(|status| status.is_ok_and(|status| status.success()))
 }
 
-fn control_command(options: &SshOptions, operation: &str) -> Command {
-    let mut command = Command::new(&options.executable);
+fn control_command(options: &SshControlOptions, operation: &str) -> Command {
+    control_command_for(
+        &options.executable,
+        &options.control_socket,
+        &options.target,
+        operation,
+    )
+}
+
+fn control_command_for(
+    executable: &Path,
+    control_socket: &Path,
+    target: &SshTarget,
+    operation: &str,
+) -> Command {
+    let mut command = Command::new(executable);
     command
         .arg("-F")
         .arg("/dev/null")
         .arg("-S")
-        .arg(&options.control_socket)
+        .arg(control_socket)
         .arg("-O")
         .arg(operation)
+        .arg("-p")
+        .arg(target.port.to_string())
+        .arg("-l")
+        .arg(&target.user)
+        .arg("-o")
+        .arg(option_with_path("UserKnownHostsFile=", &target.known_hosts))
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("CanonicalizeHostname=no")
         .arg("--")
-        .arg(&options.host)
+        .arg(&target.host)
         .env("LC_ALL", "C")
         .env_remove("SSH_ASKPASS")
         .env_remove("AP_ASKPASS_MODE")
@@ -1232,19 +1188,6 @@ fn control_command(options: &SshOptions, operation: &str) -> Command {
         .kill_on_drop(true);
     remove_loader_environment(&mut command);
     command
-}
-
-fn validate_host_alias(host: &str) -> Result<()> {
-    if host.is_empty()
-        || host.starts_with('-')
-        || host.chars().any(|character| character.is_whitespace())
-    {
-        return Err(ApError::coded(
-            "AP_INVALID_SSH_HOST",
-            "SSH Host alias must be non-empty, contain no whitespace, and not start with '-'",
-        ));
-    }
-    Ok(())
 }
 
 fn prepare_control_parent(control_socket: &Path) -> Result<()> {
@@ -1267,106 +1210,6 @@ fn remove_stale_control_socket(path: &Path) -> Result<()> {
     }
     fs::remove_file(path)?;
     Ok(())
-}
-
-/// Reclaim a ControlMaster left behind when a previous daemon was killed.
-/// Callers must hold the profile lease before invoking this function.
-pub async fn stop_existing_master(
-    executable: &Path,
-    control_socket: &Path,
-    host: &str,
-) -> Result<bool> {
-    validate_host_alias(host)?;
-    let executable = validate_ssh_executable(executable)?;
-    if !control_socket.exists() {
-        return Ok(false);
-    }
-    let metadata = fs::symlink_metadata(control_socket)?;
-    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(ApError::coded(
-            "AP_SSH_CONTROL_UNSAFE",
-            "拒绝接管非当前用户拥有的 ControlMaster socket",
-        ));
-    }
-
-    let mut check_command = Command::new(&executable);
-    check_command
-        .arg("-F")
-        .arg("/dev/null")
-        .arg("-S")
-        .arg(control_socket)
-        .arg("-O")
-        .arg("check")
-        .arg("--")
-        .arg(host)
-        .env("LC_ALL", "C")
-        .env_remove("SSH_ASKPASS")
-        .env_remove("AP_ASKPASS_MODE")
-        .env_remove("AP_ASKPASS_SOCKET")
-        .env_remove("AP_ASKPASS_NONCE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    remove_loader_environment(&mut check_command);
-    let check = timeout(CONTROL_COMMAND_TIMEOUT, check_command.status())
-        .await
-        .map_err(|_| {
-            ApError::coded(
-                "AP_SSH_CONTROL_RECLAIM_FAILED",
-                "检查遗留 OpenSSH ControlMaster 超时",
-            )
-        })??;
-    if !check.success() {
-        remove_stale_control_socket(control_socket)?;
-        return Ok(false);
-    }
-
-    let mut exit_command = Command::new(&executable);
-    exit_command
-        .arg("-F")
-        .arg("/dev/null")
-        .arg("-S")
-        .arg(control_socket)
-        .arg("-O")
-        .arg("exit")
-        .arg("--")
-        .arg(host)
-        .env("LC_ALL", "C")
-        .env_remove("SSH_ASKPASS")
-        .env_remove("AP_ASKPASS_MODE")
-        .env_remove("AP_ASKPASS_SOCKET")
-        .env_remove("AP_ASKPASS_NONCE")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    remove_loader_environment(&mut exit_command);
-    let exit = timeout(CONTROL_COMMAND_TIMEOUT, exit_command.status())
-        .await
-        .map_err(|_| {
-            ApError::coded(
-                "AP_SSH_CONTROL_RECLAIM_FAILED",
-                "停止遗留 OpenSSH ControlMaster 超时",
-            )
-        })??;
-    if !exit.success() {
-        return Err(ApError::coded(
-            "AP_SSH_CONTROL_RECLAIM_FAILED",
-            "无法停止上一次 daemon 遗留的 OpenSSH ControlMaster",
-        ));
-    }
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while control_socket.exists() && Instant::now() < deadline {
-        sleep(Duration::from_millis(50)).await;
-    }
-    if control_socket.exists() {
-        return Err(ApError::coded(
-            "AP_SSH_CONTROL_RECLAIM_FAILED",
-            "遗留的 OpenSSH ControlMaster 未在超时内退出",
-        ));
-    }
-    Ok(true)
 }
 
 fn askpass_socket_path(control_socket: &Path) -> Result<PathBuf> {
@@ -1459,11 +1302,11 @@ fn ssh_exit_error(code: Option<i32>, raw_stderr: &str) -> ApError {
     } else {
         "AP_SSH_EXITED"
     };
-    // Status and daemon logs intentionally use a bounded classification
+    // Status intentionally uses a bounded classification
     // instead of echoing arbitrary OpenSSH diagnostics, which can contain the
     // resolved host, user name, key paths, ProxyCommand output, or credentials.
     let details = match error_code {
-        "AP_SSH_AUTH_FAILED" => "SSH password authentication failed".to_owned(),
+        "AP_SSH_AUTH_FAILED" => "SSH authentication failed".to_owned(),
         "AP_SSH_CONTROL_PATH_TOO_LONG" => {
             "OpenSSH ControlPath exceeded the platform Unix-socket limit".to_owned()
         }
@@ -1474,7 +1317,7 @@ fn ssh_exit_error(code: Option<i32>, raw_stderr: &str) -> ApError {
             "the SSH server administratively prohibited remote forwarding".to_owned()
         }
         "AP_SSH_HOST_KEY" => {
-            "SSH host-key verification failed; run `ap doctor` and verify known_hosts manually"
+            "SSH host-key verification failed; run diagnostics and verify ap's known_hosts file"
                 .to_owned()
         }
         _ => format!("OpenSSH exited with status {}", code.unwrap_or(-1)),
@@ -1495,24 +1338,41 @@ mod tests {
     const WATCHDOG_TEST_HELPER_NAME: &str = "ssh::tests::watchdog_test_helper_process";
     const WATCHDOG_TEST_PARENT_NAME: &str = "ssh::tests::watchdog_test_parent_process";
 
-    fn options(authentication: SshAuthentication) -> SshOptions {
+    fn target() -> SshTarget {
+        SshTarget {
+            host: "example.invalid".to_owned(),
+            user: "deploy".to_owned(),
+            port: 2222,
+            known_hosts: "/tmp/ap-known_hosts".into(),
+            connect_timeout: Duration::from_secs(9),
+        }
+    }
+
+    fn options(auth: SshAuth) -> SshOptions {
         SshOptions {
             executable: "ssh".into(),
             ap_executable: "/usr/local/bin/ap".into(),
-            host: "server2".to_owned(),
+            target: target(),
             control_socket: "/tmp/ap-test/master.sock".into(),
             forwards: vec![RemoteForward {
                 remote_port: 17890,
                 local_gateway: "127.0.0.1:43123".parse().unwrap(),
             }],
-            authentication,
+            auth,
+            host_key_policy: HostKeyPolicy::Strict,
             startup_timeout: Duration::from_secs(1),
         }
     }
 
+    fn key_options() -> SshOptions {
+        options(SshAuth::Key {
+            identity_file: "/keys/ap_ed25519".into(),
+        })
+    }
+
     #[test]
-    fn stored_password_arguments_are_locked_down_and_secret_free() {
-        let args = build_master_args(&options(SshAuthentication::StoredPassword {
+    fn password_arguments_are_explicit_locked_down_and_secret_free() {
+        let args = build_master_args(&options(SshAuth::Password {
             provider: Arc::new(|| Ok(Zeroizing::new("top-secret".to_owned()))),
         }))
         .unwrap();
@@ -1521,6 +1381,12 @@ mod tests {
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>()
             .join(" ");
+        assert!(rendered.starts_with("-F /dev/null "));
+        assert!(rendered.contains("-p 2222 -l deploy"));
+        assert!(rendered.ends_with("-- example.invalid"));
+        assert!(rendered.contains("UserKnownHostsFile=\"/tmp/ap-known_hosts\""));
+        assert!(rendered.contains("GlobalKnownHostsFile=/dev/null"));
+        assert!(rendered.contains("ConnectTimeout=9"));
         assert!(rendered.contains("PreferredAuthentications=password"));
         assert!(rendered.contains("PasswordAuthentication=yes"));
         assert!(rendered.contains("PubkeyAuthentication=no"));
@@ -1533,13 +1399,14 @@ mod tests {
         assert!(rendered.contains("ProxyCommand=none"));
         assert!(rendered.contains("ProxyJump=none"));
         assert!(rendered.contains("KnownHostsCommand=none"));
+        assert!(!rendered.contains("-G"));
+        assert!(!rendered.contains(".ssh/config"));
         assert!(!rendered.contains("top-secret"));
     }
 
     #[test]
     fn forward_is_bound_to_remote_loopback() {
-        let args =
-            build_master_args(&options(SshAuthentication::SshConfig { batch_mode: true })).unwrap();
+        let args = build_master_args(&key_options()).unwrap();
         assert!(
             args.iter()
                 .any(|arg| { arg.to_string_lossy() == "127.0.0.1:17890:127.0.0.1:43123" })
@@ -1547,15 +1414,104 @@ mod tests {
     }
 
     #[test]
-    fn invalid_alias_cannot_be_interpreted_as_an_option() {
-        let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
-        options.host = "-oProxyCommand=bad".to_owned();
+    fn target_fields_cannot_be_interpreted_as_options() {
+        let mut options = key_options();
+        options.target.host = "-oProxyCommand=bad".to_owned();
+        assert!(build_master_args(&options).is_err());
+        options.target.host = "example.invalid".to_owned();
+        options.target.user = "bad user".to_owned();
         assert!(build_master_args(&options).is_err());
     }
 
     #[test]
+    fn key_source_is_explicit() {
+        let key = build_master_args(&key_options()).unwrap();
+        let key = key
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(key.contains("-i /keys/ap_ed25519"));
+        assert!(key.contains("IdentitiesOnly=yes"));
+        assert!(key.contains("IdentityAgent=none"));
+    }
+
+    #[test]
+    fn known_hosts_path_rejects_openssh_tokens() {
+        let mut options = key_options();
+        options.target.known_hosts = "/tmp/known-%h".into();
+        assert_eq!(
+            build_master_args(&options).unwrap_err().code(),
+            "AP_INVALID_KNOWN_HOSTS"
+        );
+    }
+
+    #[test]
+    fn accept_new_is_explicit_and_changed_keys_remain_protected() {
+        let mut options = key_options();
+        options.host_key_policy = HostKeyPolicy::AcceptNew;
+        let rendered = build_master_args(&options)
+            .unwrap()
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(rendered.contains("StrictHostKeyChecking=accept-new"));
+    }
+
+    #[test]
+    fn control_commands_ignore_ssh_config_and_use_explicit_target() {
+        let options = key_options();
+        let control = SshControlOptions::from(&options);
+        let command = control_command(&control, "check");
+        let rendered = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(rendered.starts_with("-F /dev/null "));
+        assert!(rendered.contains("-p 2222 -l deploy"));
+        assert!(rendered.ends_with("-- example.invalid"));
+        assert!(!rendered.contains("-G"));
+    }
+
+    #[test]
+    fn established_master_state_is_authentication_free() {
+        // Keep these destructures exhaustive. Adding an authentication field
+        // to either long-lived type makes this regression test fail to compile.
+        fn assert_layout(master: &SshMaster) {
+            let SshMaster {
+                child: _,
+                ssh_pid: _,
+                ssh_own_process_group: _,
+                watchdog_liveness: _,
+                control,
+                stderr: _,
+                stderr_task: _,
+            } = master;
+            let SshControlOptions {
+                executable: _,
+                control_socket: _,
+                target: _,
+            } = control;
+        }
+
+        let _ = assert_layout as fn(&SshMaster);
+
+        let provider: PasswordProvider = Arc::new(|| Ok(Zeroizing::new("secret".to_owned())));
+        let options = options(SshAuth::Password {
+            provider: Arc::clone(&provider),
+        });
+        let control = SshControlOptions::from(&options);
+        drop(options);
+        assert_eq!(Arc::strong_count(&provider), 1);
+        std::hint::black_box(control);
+    }
+
+    #[test]
     fn rejects_control_paths_without_openssh_temporary_headroom() {
-        let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
+        let mut options = key_options();
         options.control_socket = PathBuf::from(format!("/{}", "x".repeat(MAX_CONTROL_PATH_BYTES)));
         assert_eq!(
             build_master_args(&options).unwrap_err().code(),
@@ -1565,7 +1521,7 @@ mod tests {
 
     #[test]
     fn control_path_limit_accepts_boundary_and_rejects_next_byte() {
-        let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
+        let mut options = key_options();
         options.control_socket =
             PathBuf::from(format!("/{}", "x".repeat(MAX_CONTROL_PATH_BYTES - 1)));
         assert_eq!(
@@ -1588,7 +1544,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_accepts_a_control_path_longer_than_the_macos_limit() {
-        let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
+        let mut options = key_options();
         options.control_socket = PathBuf::from(format!("/{}", "x".repeat(84)));
         assert_eq!(options.control_socket.as_os_str().as_bytes().len(), 85);
         assert!(build_master_args(&options).is_ok());
@@ -1596,7 +1552,7 @@ mod tests {
 
     #[test]
     fn rejects_openssh_tokens_in_control_path() {
-        let mut options = options(SshAuthentication::SshConfig { batch_mode: true });
+        let mut options = key_options();
         options.control_socket = PathBuf::from("/tmp/ap-%h/control.sock");
         assert_eq!(
             build_master_args(&options).unwrap_err().code(),
@@ -1605,8 +1561,8 @@ mod tests {
     }
 
     #[test]
-    fn stored_password_reserves_space_for_askpass_socket() {
-        let mut options = options(SshAuthentication::StoredPassword {
+    fn password_reserves_space_for_askpass_socket() {
+        let mut options = options(SshAuth::Password {
             provider: Arc::new(|| Ok(Zeroizing::new("top-secret".to_owned()))),
         });
         options.control_socket = PathBuf::from(format!("/{}/s", "x".repeat(70)));
@@ -1637,65 +1593,10 @@ mod tests {
     }
 
     #[test]
-    fn config_with_extra_forward_is_rejected_without_echoing_it() {
-        let error = parse_ssh_config(
-            "hostname example.invalid\nport 22\nremotecommand none\nremoteforward 19000 10.0.0.1:1234\n",
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), "AP_SSH_UNSAFE_ALIAS");
-        assert!(!error.to_string().contains("10.0.0.1"));
-    }
-
-    #[test]
-    fn config_reports_local_helpers_without_echoing_commands() {
-        let inspection = parse_ssh_config(
-            "hostname example.invalid\nproxycommand /tmp/steal-secrets --flag\nproxyjump jump-host\nknownhostscommand none\n",
-        )
-        .unwrap();
-        assert_eq!(inspection.credential_helpers.len(), 2);
-        assert_eq!(inspection.credential_helpers[0].name, "proxycommand");
-        assert_eq!(inspection.credential_helpers[1].name, "proxyjump");
-        assert!(!format!("{inspection:?}").contains("steal-secrets"));
-        assert!(!format!("{inspection:?}").contains("jump-host"));
-    }
-
-    #[test]
     fn resolves_a_trusted_absolute_system_ssh() {
         let executable = system_ssh_executable().unwrap();
         assert!(executable.is_absolute());
         assert_eq!(fs::metadata(&executable).unwrap().uid(), 0);
-    }
-
-    #[test]
-    fn anonymous_config_path_is_not_user_replaceable() {
-        let metadata = fs::symlink_metadata(ANONYMOUS_CONFIG_PATH).unwrap();
-        assert_eq!(metadata.uid(), 0);
-        assert_eq!(ANONYMOUS_CONFIG_PATH, "/dev/stdin");
-    }
-
-    #[tokio::test]
-    async fn openssh_can_reparse_effective_config_from_anonymous_stdin() {
-        let executable = system_ssh_executable().unwrap();
-        let (_inspection, effective) = load_effective_ssh_config(&executable, "localhost")
-            .await
-            .unwrap();
-        let mut child = Command::new(executable)
-            .arg("-G")
-            .arg("-F")
-            .arg(ANONYMOUS_CONFIG_PATH)
-            .arg("--")
-            .arg("localhost")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        write_anonymous_config(&mut child, effective.as_slice())
-            .await
-            .unwrap();
-        drop(effective);
-        let status = child.wait().await.unwrap();
-        assert!(status.success());
     }
 
     /// A deliberately long-lived stand-in for OpenSSH. This test is also an

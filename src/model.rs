@@ -1,31 +1,28 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 
-use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 use crate::error::{ApError, Result};
 
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 pub const MIN_REMOTE_PORT: u16 = 1024;
+pub const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 15;
+pub const MAX_CONNECT_TIMEOUT_SECONDS: u64 = 300;
 
+/// The complete, user-authored configuration document.
+///
+/// This type intentionally has no mutation helpers. Every explicit start or
+/// restart reads a new document and turns one entry into an immutable
+/// [`ResolvedConnection`] snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default = "default_config_version")]
     pub version: u32,
     #[serde(default)]
-    pub servers: BTreeMap<String, ServerConfig>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            version: CONFIG_VERSION,
-            servers: BTreeMap::new(),
-        }
-    }
+    pub connections: BTreeMap<String, ConnectionConfig>,
 }
 
 impl Config {
@@ -34,127 +31,126 @@ impl Config {
             return Err(ApError::coded(
                 "AP_CONFIG_VERSION_UNSUPPORTED",
                 format!(
-                    "配置版本 {} 不受支持，当前仅支持版本 {CONFIG_VERSION}",
+                    "Configuration version {} is not supported; expected version {CONFIG_VERSION}",
                     self.version
                 ),
             ));
         }
 
-        let mut ids = HashSet::new();
-        for (name, server) in &self.servers {
-            validate_name("server", name)?;
-            server.validate(name)?;
-            if !ids.insert(server.id) {
-                return Err(invalid_config(format!(
-                    "server {name:?} 与另一个 server 使用了相同 UUID"
-                )));
-            }
+        for (name, connection) in &self.connections {
+            validate_name("connection", name)?;
+            connection.validate(name)?;
         }
         Ok(())
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ServerConfig {
-    pub id: Uuid,
-    pub ssh_host: String,
-    #[serde(default)]
-    pub auth_mode: AuthMode,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ssh_secret_ref: Option<String>,
-    #[serde(default)]
-    pub autostart: bool,
+#[serde(deny_unknown_fields)]
+pub struct ConnectionConfig {
+    pub ssh: SshConfig,
     #[serde(default)]
     pub proxies: Vec<ProxyMapping>,
 }
 
-impl ServerConfig {
-    pub fn new(ssh_host: impl Into<String>) -> Self {
-        Self {
-            id: Uuid::new_v4(),
-            ssh_host: ssh_host.into(),
-            auth_mode: AuthMode::SshConfig,
-            ssh_secret_ref: None,
-            autostart: false,
-            proxies: Vec::new(),
-        }
+impl ConnectionConfig {
+    pub fn validate(&self, connection_name: &str) -> Result<()> {
+        self.ssh.validate(connection_name)?;
+        validate_proxy_mappings(connection_name, &self.proxies)
     }
+}
 
-    pub fn validate(&self, server_name: &str) -> Result<()> {
-        validate_ssh_alias(&self.ssh_host)?;
-        if self.id.is_nil() {
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SshConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    #[serde(default = "default_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<PathBuf>,
+}
+
+impl SshConfig {
+    pub fn validate(&self, connection_name: &str) -> Result<()> {
+        validate_ssh_host(&self.host)?;
+        validate_ssh_user(&self.user)?;
+        if self.port == 0 {
             return Err(invalid_config(format!(
-                "server {server_name:?} 的 UUID 不能为 nil"
+                "Connection {connection_name:?} has an invalid SSH port"
             )));
         }
-
-        let expected_ref = ssh_secret_ref(self.id);
-        match self.auth_mode {
-            AuthMode::SshConfig if self.ssh_secret_ref.is_some() => {
-                return Err(invalid_config(format!(
-                    "server {server_name:?} 使用 ssh-config 时不能设置 ssh_secret_ref"
-                )));
-            }
-            AuthMode::StoredPassword if self.ssh_secret_ref.as_deref() != Some(&expected_ref) => {
-                return Err(invalid_config(format!(
-                    "server {server_name:?} 的 ssh_secret_ref 必须为 {expected_ref:?}"
-                )));
-            }
-            _ => {}
+        if !(1..=MAX_CONNECT_TIMEOUT_SECONDS).contains(&self.connect_timeout_seconds) {
+            return Err(invalid_config(format!(
+                "Connection {connection_name:?} connect_timeout_seconds must be between 1 and {MAX_CONNECT_TIMEOUT_SECONDS}"
+            )));
         }
-
-        let mut names = HashSet::new();
-        let mut ports = HashSet::new();
-        for mapping in &self.proxies {
-            mapping.validate()?;
-            if !names.insert(mapping.name.as_str()) {
-                return Err(invalid_config(format!(
-                    "server {server_name:?} 中 proxy 名称 {:?} 重复",
-                    mapping.name
-                )));
-            }
-            if !ports.insert(mapping.remote_port) {
-                return Err(invalid_config(format!(
-                    "server {server_name:?} 中远端端口 {} 重复",
-                    mapping.remote_port
-                )));
-            }
+        if let Some(identity_file) = &self.identity_file {
+            validate_absolute_path("SSH identity_file", identity_file, true)?;
         }
         Ok(())
     }
+}
 
-    pub fn use_stored_password(&mut self) {
-        self.auth_mode = AuthMode::StoredPassword;
-        self.ssh_secret_ref = Some(ssh_secret_ref(self.id));
-    }
+/// Authentication mode for a resolved connection snapshot. `Password` is a
+/// marker only: secret material is supplied by the runtime layer and is never
+/// read from configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "method", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum ResolvedSshAuth {
+    Key { identity_file: PathBuf },
+    Password,
+}
 
-    pub fn use_ssh_config(&mut self) {
-        self.auth_mode = AuthMode::SshConfig;
-        self.ssh_secret_ref = None;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedSshConfig {
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    pub connect_timeout_seconds: u64,
+    pub auth: ResolvedSshAuth,
+}
+
+/// A validated, serializable connection snapshot used by the supervisor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedConnection {
+    pub name: String,
+    pub ssh: ResolvedSshConfig,
+    pub proxies: Vec<ProxyMapping>,
+}
+
+impl ResolvedConnection {
+    pub fn validate(&self) -> Result<()> {
+        validate_name("connection", &self.name)?;
+        validate_ssh_host(&self.ssh.host)?;
+        validate_ssh_user(&self.ssh.user)?;
+        if self.ssh.port == 0 {
+            return Err(invalid_config(format!(
+                "Connection {:?} has an invalid SSH port",
+                self.name
+            )));
+        }
+        if !(1..=MAX_CONNECT_TIMEOUT_SECONDS).contains(&self.ssh.connect_timeout_seconds) {
+            return Err(invalid_config(format!(
+                "Connection {:?} connect_timeout_seconds must be between 1 and {MAX_CONNECT_TIMEOUT_SECONDS}",
+                self.name
+            )));
+        }
+        match &self.ssh.auth {
+            ResolvedSshAuth::Key { identity_file } => {
+                validate_absolute_path("SSH identity_file", identity_file, true)?
+            }
+            ResolvedSshAuth::Password => {}
+        }
+        validate_proxy_mappings(&self.name, &self.proxies)
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-#[value(rename_all = "kebab-case")]
-pub enum AuthMode {
-    #[default]
-    SshConfig,
-    StoredPassword,
-}
-
-impl fmt::Display for AuthMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::SshConfig => "ssh-config",
-            Self::StoredPassword => "stored-password",
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-#[value(rename_all = "lowercase")]
 pub enum ProxyProtocol {
     Http,
     Socks5,
@@ -162,8 +158,8 @@ pub enum ProxyProtocol {
 }
 
 impl fmt::Display for ProxyProtocol {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
             Self::Http => "http",
             Self::Socks5 => "socks5",
             Self::Mixed => "mixed",
@@ -172,8 +168,8 @@ impl fmt::Display for ProxyProtocol {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyMapping {
-    pub name: String,
     pub protocol: ProxyProtocol,
     pub local: SocketAddr,
     pub remote_port: u16,
@@ -181,33 +177,50 @@ pub struct ProxyMapping {
 
 impl ProxyMapping {
     pub fn validate(&self) -> Result<()> {
-        validate_name("proxy", &self.name)?;
-        if !matches!(
-            self.local.ip(),
-            IpAddr::V4(address) if address == Ipv4Addr::LOCALHOST
-        ) && !matches!(
-            self.local.ip(),
-            IpAddr::V6(address) if address == Ipv6Addr::LOCALHOST
-        ) {
+        if !is_supported_loopback(self.local.ip()) {
             return Err(invalid_config(format!(
-                "proxy {:?} 的本机端点必须使用 127.0.0.1 或 ::1",
-                self.name
+                "Proxy mapping for remote port {} must use 127.0.0.1 or ::1 as its local endpoint",
+                self.remote_port
             )));
         }
         if self.local.port() == 0 {
             return Err(invalid_config(format!(
-                "proxy {:?} 的本机端口不能为 0",
-                self.name
+                "Proxy mapping for remote port {} must not use local port zero",
+                self.remote_port
             )));
         }
         if self.remote_port < MIN_REMOTE_PORT {
             return Err(invalid_config(format!(
-                "proxy {:?} 的远端端口必须处于 {MIN_REMOTE_PORT}–65535",
-                self.name
+                "Proxy remote port must be between {MIN_REMOTE_PORT} and 65535"
             )));
         }
         Ok(())
     }
+}
+
+fn validate_proxy_mappings(connection_name: &str, proxies: &[ProxyMapping]) -> Result<()> {
+    if proxies.is_empty() {
+        return Err(invalid_config(format!(
+            "Connection {connection_name:?} must define at least one proxy mapping"
+        )));
+    }
+
+    let mut ports = HashSet::new();
+    for mapping in proxies {
+        mapping.validate()?;
+        if !ports.insert(mapping.remote_port) {
+            return Err(invalid_config(format!(
+                "Connection {connection_name:?} contains duplicate remote port {}",
+                mapping.remote_port
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn is_supported_loopback(address: IpAddr) -> bool {
+    matches!(address, IpAddr::V4(ip) if ip == Ipv4Addr::LOCALHOST)
+        || matches!(address, IpAddr::V6(ip) if ip == Ipv6Addr::LOCALHOST)
 }
 
 pub fn validate_name(kind: &str, value: &str) -> Result<()> {
@@ -218,32 +231,77 @@ pub fn validate_name(kind: &str, value: &str) -> Result<()> {
         });
     if !valid {
         return Err(invalid_config(format!(
-            "{kind} 名称必须以 ASCII 字母或数字开头，且仅包含字母、数字、点、下划线或连字符（最长 64 字节）"
+            "{kind} name must start with an ASCII letter or digit, contain only letters, digits, '.', '_' or '-', and be at most 64 bytes"
         )));
     }
     Ok(())
 }
 
-pub fn validate_ssh_alias(alias: &str) -> Result<()> {
-    let valid = !alias.is_empty()
-        && alias.len() <= 255
-        && alias.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_alphanumeric() || (index > 0 && b"._-".contains(&byte))
-        });
+pub fn validate_ssh_host(host: &str) -> Result<()> {
+    let valid = host.parse::<IpAddr>().is_ok() || valid_dns_name(host);
     if !valid {
         return Err(invalid_config(
-            "SSH Host 必须是专用的安全别名：以 ASCII 字母或数字开头，且仅包含字母、数字、点、下划线或连字符",
+            "SSH host must be a DNS name or unbracketed IP address, contain no user or option syntax, and be at most 255 bytes",
         ));
     }
     Ok(())
 }
 
-pub fn ssh_secret_ref(id: Uuid) -> String {
-    format!("ap:ssh-password:{id}")
+fn valid_dns_name(host: &str) -> bool {
+    if host.is_empty()
+        || host.len() > 255
+        || host.starts_with('-')
+        || host.contains('@')
+        || !host.is_ascii()
+    {
+        return false;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
-fn default_config_version() -> u32 {
-    CONFIG_VERSION
+pub fn validate_ssh_user(user: &str) -> Result<()> {
+    let valid = !user.is_empty()
+        && user.len() <= 64
+        && !user.starts_with('-')
+        && user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
+    if !valid {
+        return Err(invalid_config(
+            "SSH user must contain only ASCII letters, digits, '.', '_' or '-' and be at most 64 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_absolute_path(label: &str, path: &std::path::Path, reject_tokens: bool) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(invalid_config(format!("{label} must be an absolute path")));
+    }
+    #[cfg(unix)]
+    if reject_tokens {
+        use std::os::unix::ffi::OsStrExt as _;
+        if path.as_os_str().as_bytes().contains(&b'%') {
+            return Err(invalid_config(format!(
+                "{label} must not contain OpenSSH '%' tokens"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn default_connect_timeout_seconds() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT_SECONDS
 }
 
 fn invalid_config(message: impl Into<String>) -> ApError {
@@ -254,9 +312,18 @@ fn invalid_config(message: impl Into<String>) -> ApError {
 mod tests {
     use super::*;
 
-    fn mapping(name: &str, local: &str, remote_port: u16) -> ProxyMapping {
+    fn ssh(identity_file: Option<&str>) -> SshConfig {
+        SshConfig {
+            host: "server.example".into(),
+            port: 22,
+            user: "alice".into(),
+            connect_timeout_seconds: DEFAULT_CONNECT_TIMEOUT_SECONDS,
+            identity_file: identity_file.map(PathBuf::from),
+        }
+    }
+
+    fn mapping(local: &str, remote_port: u16) -> ProxyMapping {
         ProxyMapping {
-            name: name.into(),
             protocol: ProxyProtocol::Http,
             local: local.parse().unwrap(),
             remote_port,
@@ -264,47 +331,120 @@ mod tests {
     }
 
     #[test]
-    fn validates_loopback_and_remote_port() {
-        assert!(mapping("web", "127.0.0.1:7890", 17890).validate().is_ok());
-        assert!(mapping("web", "[::1]:7890", 17890).validate().is_ok());
-        assert!(mapping("web", "127.0.0.2:7890", 17890).validate().is_err());
-        assert!(mapping("web", "192.0.2.1:7890", 17890).validate().is_err());
-        assert!(mapping("web", "127.0.0.1:7890", 1023).validate().is_err());
-    }
+    fn parses_key_and_password_authentication_modes() {
+        let password: Config = toml::from_str(
+            r#"
+version = 2
+[connections.dev.ssh]
+host = "server.example"
+port = 22
+user = "alice"
+[[connections.dev.proxies]]
+protocol = "mixed"
+local = "127.0.0.1:7890"
+remote_port = 17890
+"#,
+        )
+        .unwrap();
+        password.validate().unwrap();
+        assert_eq!(password.connections["dev"].ssh.identity_file, None);
 
-    #[test]
-    fn rejects_duplicate_mapping_names_and_ports() {
-        let mut server = ServerConfig::new("server2");
-        server.proxies = vec![
-            mapping("web", "127.0.0.1:7890", 17890),
-            mapping("web", "127.0.0.1:7891", 17891),
-        ];
-        assert!(server.validate("dev").is_err());
-
-        server.proxies[1].name = "socks".into();
-        server.proxies[1].remote_port = 17890;
-        assert!(server.validate("dev").is_err());
-    }
-
-    #[test]
-    fn stored_password_reference_is_stable() {
-        let mut server = ServerConfig::new("server2");
-        let id = server.id;
-        server.use_stored_password();
+        let key: Config = toml::from_str(
+            r#"
+version = 2
+[connections.dev.ssh]
+host = "server.example"
+port = 22
+user = "alice"
+identity_file = "/keys/id_ed25519"
+[[connections.dev.proxies]]
+protocol = "mixed"
+local = "127.0.0.1:7890"
+remote_port = 17890
+"#,
+        )
+        .unwrap();
+        key.validate().unwrap();
         assert_eq!(
-            server.ssh_secret_ref.as_deref(),
-            Some(ssh_secret_ref(id).as_str())
+            key.connections["dev"].ssh.identity_file.as_deref(),
+            Some(std::path::Path::new("/keys/id_ed25519"))
         );
-        assert!(server.validate("dev").is_ok());
-        server.use_ssh_config();
-        assert!(server.ssh_secret_ref.is_none());
     }
 
     #[test]
-    fn rejects_option_like_or_pattern_aliases() {
-        for alias in ["-oProxyCommand=bad", "host name", "host*", ""] {
-            assert!(validate_ssh_alias(alias).is_err(), "accepted {alias:?}");
+    fn rejects_unknown_fields() {
+        let input = r#"
+version = 2
+unexpected = true
+"#;
+        assert!(toml::from_str::<Config>(input).is_err());
+    }
+
+    #[test]
+    fn validates_loopback_and_remote_port() {
+        assert!(mapping("127.0.0.1:7890", 17890).validate().is_ok());
+        assert!(mapping("[::1]:7890", 17890).validate().is_ok());
+        assert!(mapping("127.0.0.2:7890", 17890).validate().is_err());
+        assert!(mapping("192.0.2.1:7890", 17890).validate().is_err());
+        assert!(mapping("127.0.0.1:7890", 1023).validate().is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_remote_ports() {
+        let connection = ConnectionConfig {
+            ssh: ssh(None),
+            proxies: vec![
+                mapping("127.0.0.1:7890", 17890),
+                mapping("127.0.0.1:7891", 17890),
+            ],
+        };
+        assert!(connection.validate("dev").is_err());
+    }
+
+    #[test]
+    fn rejects_alias_and_option_syntax() {
+        for host in ["-oProxyCommand=bad", "host name", "user@host", "[::1]", ""] {
+            assert!(validate_ssh_host(host).is_err(), "accepted {host:?}");
         }
-        assert!(validate_ssh_alias("server2").is_ok());
+        for host in ["server.example", "192.0.2.10", "2001:db8::1"] {
+            validate_ssh_host(host).unwrap();
+        }
+    }
+
+    #[test]
+    fn requires_an_absolute_authentication_path() {
+        assert!(ssh(Some("id_ed25519")).validate("dev").is_err());
+    }
+
+    #[test]
+    fn rejects_every_legacy_authentication_and_proxy_field() {
+        let prefix = r#"
+version = 2
+[connections.dev.ssh]
+host = "server.example"
+port = 22
+user = "alice"
+"#;
+        let suffix = r#"
+[[connections.dev.proxies]]
+protocol = "mixed"
+local = "127.0.0.1:7890"
+remote_port = 17890
+"#;
+        for legacy in [
+            "method = \"agent\"\n",
+            "password_file = \"/tmp/password\"\n",
+            "socket = \"/tmp/agent.sock\"\n",
+            "[connections.dev.ssh.auth]\nmethod = \"key\"\nidentity_file = \"/tmp/key\"\n",
+        ] {
+            let text = format!("{prefix}{legacy}{suffix}");
+            assert!(
+                toml::from_str::<Config>(&text).is_err(),
+                "accepted {legacy:?}"
+            );
+        }
+
+        let proxy_name = format!("{prefix}{suffix}name = \"mixed\"\n");
+        assert!(toml::from_str::<Config>(&proxy_name).is_err());
     }
 }

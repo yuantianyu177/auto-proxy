@@ -22,7 +22,7 @@ pub fn disable_core_dumps() -> Result<()> {
         Err(ApError::coded(
             "AP_PROCESS_HARDENING_FAILED",
             format!(
-                "无法禁用 core dump；为避免凭据进入崩溃文件，ap 拒绝继续：{}",
+                "Cannot disable core dumps; refusing to handle credentials: {}",
                 std::io::Error::last_os_error()
             ),
         ))

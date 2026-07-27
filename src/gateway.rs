@@ -38,7 +38,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    model::{ProxyMapping, ProxyProtocol},
+    model::{ProxyMapping, ProxyProtocol, is_supported_loopback},
     secrets::ProxyCredential,
 };
 
@@ -332,7 +332,7 @@ pub async fn start_gateway(
     credential: GatewayCredential,
     parent_cancel: CancellationToken,
 ) -> std::io::Result<RunningGateway> {
-    if !upstream.ip().is_loopback() {
+    if !is_supported_loopback(upstream.ip()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "upstream proxy must use a loopback address",
@@ -367,14 +367,14 @@ pub async fn start_gateway(
     })
 }
 
-/// Start a gateway directly from persisted profile data.
+/// Start a gateway from one immutable proxy mapping.
 pub async fn start_mapping_gateway(
     mapping: &ProxyMapping,
     credential: &ProxyCredential,
     parent_cancel: CancellationToken,
 ) -> std::io::Result<RunningGateway> {
     start_gateway(
-        mapping.name.clone(),
+        format!("remote-{}", mapping.remote_port),
         mapping.protocol.into(),
         mapping.local,
         GatewayCredential::new(credential.username(), credential.password()),

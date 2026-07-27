@@ -3,28 +3,24 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum ApError {
     #[error("{code}: {message}")]
-    Coded { code: &'static str, message: String },
+    Coded { code: String, message: String },
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
-
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
 }
 
 impl ApError {
-    pub fn coded(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn coded(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self::Coded {
-            code,
+            code: code.into(),
             message: message.into(),
         }
     }
 
-    pub fn code(&self) -> &'static str {
+    pub fn code(&self) -> &str {
         match self {
-            Self::Coded { code, .. } => code,
+            Self::Coded { code, .. } => code.as_str(),
             Self::Io(_) => "AP_IO_ERROR",
-            Self::Other(_) => "AP_ERROR",
         }
     }
 }

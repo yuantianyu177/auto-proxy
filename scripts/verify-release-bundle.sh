@@ -30,6 +30,7 @@ fi
 
 expected_files=(
   "CHANGELOG.md"
+  "config.example.toml"
   "LICENSE"
   "README.md"
   "ap-v${version}-aarch64-apple-darwin.tar.gz"
@@ -44,6 +45,15 @@ for file in "${expected_files[@]}"; do
     exit 1
   fi
 done
+expected_bundle_entries="$({
+  printf '%s\n' "${expected_files[@]}"
+  printf '%s\n' "SHA256SUMS"
+} | LC_ALL=C sort)"
+actual_bundle_entries="$(find "${bundle_directory}" -mindepth 1 -maxdepth 1 -exec basename {} \; | LC_ALL=C sort)"
+if [[ "${actual_bundle_entries}" != "${expected_bundle_entries}" ]]; then
+  echo "release bundle does not contain the exact asset set" >&2
+  exit 1
+fi
 checksum_entries="$(wc -l < "${checksum_file}" | tr -d ' ')"
 if [[ "${checksum_entries}" != "${#expected_files[@]}" ]]; then
   echo "SHA256SUMS should contain ${#expected_files[@]} entries, found ${checksum_entries}" >&2
@@ -88,6 +98,7 @@ do
       "${archive_base}/LICENSE-MIT" \
       "${archive_base}/LICENSE-APACHE" \
       "${archive_base}/CHANGELOG.md" \
+      "${archive_base}/config.example.toml" \
       | LC_ALL=C sort
   )"
   if [[ "${actual_members}" != "${expected_members}" ]]; then

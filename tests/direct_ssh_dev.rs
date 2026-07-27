@@ -1,16 +1,16 @@
-//! Real, opt-in development integration test for the local `server2` SSH alias.
+//! Real, opt-in development integration test for an explicit SSH destination.
 //!
 //! This test never executes a remote command and does not install or modify
 //! anything remotely. Both SSH processes use `-N -T`; their remote listeners
 //! disappear with the connections. All proxy and origin behavior is provided
-//! by temporary listeners on this machine, so `server2` needs no Internet or
+//! by temporary listeners on this machine, so `direct` needs no Internet or
 //! DNS access.
 
-use std::{net::SocketAddr, process::Stdio, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, process::Stdio, time::Duration};
 
 use auto_proxy::{
     gateway::{GatewayCredential, GatewayProtocol, start_gateway},
-    ssh::{RemoteForward, SshAuthentication, SshMaster, SshOptions, system_ssh_executable},
+    ssh::{RemoteForward, SshAuth, SshMaster, SshOptions, SshTarget, system_ssh_executable},
 };
 use base64::{
     Engine as _,
@@ -25,55 +25,34 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-const DEFAULT_HOST: &str = "server2";
-const HOST_OVERRIDE_ENV: &str = "AP_SERVER2_TEST_HOST";
+const RUN_ENV: &str = "AP_RUN_DIRECT_SSH_DEV_TEST";
+const HOST_ENV: &str = "AP_DIRECT_SSH_DEV_HOST";
+const PORT_ENV: &str = "AP_DIRECT_SSH_DEV_PORT";
+const USER_ENV: &str = "AP_DIRECT_SSH_DEV_USER";
+const IDENTITY_ENV: &str = "AP_DIRECT_SSH_DEV_IDENTITY_FILE";
+const KNOWN_HOSTS_ENV: &str = "AP_DIRECT_SSH_DEV_KNOWN_HOSTS";
 
 /// Run explicitly with:
 ///
-/// `AP_RUN_SERVER2_TEST=1 cargo test --test server2_dev -- --ignored --nocapture`
-///
-/// CI may additionally set `AP_SERVER2_TEST_HOST` to an ephemeral SSH config
-/// alias. Without that override the test always uses `server2`.
+/// `AP_RUN_DIRECT_SSH_DEV_TEST=1 cargo test --test direct_ssh_dev -- --ignored --nocapture`
 #[tokio::test]
-#[ignore = "requires explicit AP_RUN_SERVER2_TEST=1 and an authorized SSH Host alias"]
-async fn server2_reverse_forward_protocols_and_reconnect() {
-    if std::env::var("AP_RUN_SERVER2_TEST").as_deref() != Ok("1") {
-        eprintln!("skipped: set AP_RUN_SERVER2_TEST=1 to authorize the real server2 test");
+#[ignore = "requires explicit direct SSH destination variables"]
+async fn direct_ssh_reverse_forward_protocols_and_reconnect() {
+    if std::env::var(RUN_ENV).as_deref() != Ok("1") {
+        eprintln!("skipped: set {RUN_ENV}=1 to authorize the real direct SSH test");
         return;
     }
 
-    // CI supplies an ephemeral Host alias backed by an isolated sshd. Keeping
-    // the override opt-in preserves `server2` as the developer-test default.
-    let host = std::env::var(HOST_OVERRIDE_ENV).unwrap_or_else(|_| DEFAULT_HOST.to_owned());
-    assert!(
-        !host.is_empty()
-            && host.len() <= 255
-            && host
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
-        "{HOST_OVERRIDE_ENV} must be a plain OpenSSH Host alias"
-    );
-
-    // Resolve the alias using OpenSSH itself. Do not print the expanded output,
-    // because it can contain real host names, users, and key paths.
+    let target = direct_target_from_env();
+    let identity_file = PathBuf::from(required_env(IDENTITY_ENV));
     let ssh_executable = system_ssh_executable().expect("trusted system OpenSSH is unavailable");
-    let config = Command::new(&ssh_executable)
-        .args(["-G", "--", &host])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .expect("failed to execute system ssh -G");
-    assert!(config.success(), "ssh -G test Host alias failed");
 
     let (http_upstream, mut observed_http, http_mock_task) = spawn_mock_http_proxy().await;
     let (socks_upstream, observed_socks, socks_mock_task) = spawn_mock_socks_proxy().await;
     let proxy_token = random_proxy_token();
     let credential = GatewayCredential::new("ap", &proxy_token);
     let http_gateway = start_gateway(
-        "server2-http",
+        "direct-http",
         GatewayProtocol::Http,
         http_upstream,
         credential.clone(),
@@ -82,7 +61,7 @@ async fn server2_reverse_forward_protocols_and_reconnect() {
     .await
     .expect("failed to start local HTTP authentication gateway");
     let socks_gateway = start_gateway(
-        "server2-socks",
+        "direct-socks",
         GatewayProtocol::Socks5,
         socks_upstream,
         credential,
@@ -94,7 +73,7 @@ async fn server2_reverse_forward_protocols_and_reconnect() {
     let (http_remote_port, socks_remote_port) = random_distinct_high_ports();
     let temporary = tempfile::tempdir_in("/tmp").expect("failed to create private temp directory");
     let options = SshOptions::new(
-        host.clone(),
+        target.clone(),
         temporary.path().join("master.sock"),
         vec![
             RemoteForward {
@@ -106,21 +85,23 @@ async fn server2_reverse_forward_protocols_and_reconnect() {
                 local_gateway: socks_gateway.listen_addr,
             },
         ],
-        SshAuthentication::SshConfig { batch_mode: true },
+        SshAuth::Key {
+            identity_file: identity_file.clone(),
+        },
     )
     .expect("failed to construct SSH options")
     .with_ap_executable(env!("CARGO_BIN_EXE_ap"));
     let master = SshMaster::start(options.clone())
         .await
-        .expect("failed to establish server2 reverse forwards");
+        .expect("failed to establish direct reverse forwards");
 
-    // The second SSH connection only exposes the two remote loopback listeners
-    // back to this test. The dedicated alias has already been checked by
-    // SshMaster for inherited forwards and remote/local commands.
+    // The second explicit SSH connection only exposes the two remote loopback
+    // listeners back to this test.
     let (http_local_port, socks_local_port) = choose_distinct_local_ports().await;
     let mut local_forward = spawn_local_forward(
         &ssh_executable,
-        &host,
+        &target,
+        &identity_file,
         http_local_port,
         http_remote_port,
         socks_local_port,
@@ -128,7 +109,7 @@ async fn server2_reverse_forward_protocols_and_reconnect() {
     );
     let wrong_authorization = BASE64.encode("ap:definitely-wrong");
     let bad_request = format!(
-        "GET http://server2-test.invalid/rejected HTTP/1.1\r\nHost: server2-test.invalid\r\nProxy-Authorization: Basic {wrong_authorization}\r\nConnection: close\r\n\r\n"
+        "GET http://direct-test.invalid/rejected HTTP/1.1\r\nHost: direct-test.invalid\r\nProxy-Authorization: Basic {wrong_authorization}\r\nConnection: close\r\n\r\n"
     );
     // A freshly started `ssh -L` can bind its local listener just before its
     // transport is ready to open channels. Retry only this readiness probe so
@@ -149,14 +130,14 @@ async fn server2_reverse_forward_protocols_and_reconnect() {
         &mut local_forward,
         http_local_port,
         &format!(
-            "GET http://server2-test.invalid/check HTTP/1.1\r\nHost: server2-test.invalid\r\nProxy-Authorization: Basic {authorization}\r\nProxy-Connection: keep-alive\r\nConnection: close\r\n\r\n"
+            "GET http://direct-test.invalid/check HTTP/1.1\r\nHost: direct-test.invalid\r\nProxy-Authorization: Basic {authorization}\r\nProxy-Connection: keep-alive\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
     assert!(response.starts_with(b"HTTP/1.1 200"));
-    assert!(response.ends_with(b"server2-ok"));
+    assert!(response.ends_with(b"direct-ok"));
     let observed = recv_http_observation(&mut observed_http).await;
-    assert!(observed.starts_with("GET http://server2-test.invalid/check HTTP/1.1\r\n"));
+    assert!(observed.starts_with("GET http://direct-test.invalid/check HTTP/1.1\r\n"));
     assert!(
         !observed
             .to_ascii_lowercase()
@@ -189,7 +170,7 @@ async fn server2_reverse_forward_protocols_and_reconnect() {
     // that a full profile-style reconnect restores forwarding.
     let reconnected = SshMaster::start(options)
         .await
-        .expect("failed to restore the same server2 reverse forwards");
+        .expect("failed to restore the same direct reverse forwards");
     // The long-lived `-L` probe connection may observe the remote listener's
     // teardown/rebind slightly after the new ControlMaster reports success.
     // Re-establish end-to-end readiness with a request that cannot reach the
@@ -200,14 +181,14 @@ async fn server2_reverse_forward_protocols_and_reconnect() {
         &mut local_forward,
         http_local_port,
         &format!(
-            "GET http://server2-test.invalid/reconnected HTTP/1.1\r\nHost: server2-test.invalid\r\nProxy-Authorization: Basic {authorization}\r\nConnection: close\r\n\r\n"
+            "GET http://direct-test.invalid/reconnected HTTP/1.1\r\nHost: direct-test.invalid\r\nProxy-Authorization: Basic {authorization}\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
     assert!(response.starts_with(b"HTTP/1.1 200"));
-    assert!(response.ends_with(b"server2-ok"));
+    assert!(response.ends_with(b"direct-ok"));
     let observed = recv_http_observation(&mut observed_http).await;
-    assert!(observed.starts_with("GET http://server2-test.invalid/reconnected HTTP/1.1\r\n"));
+    assert!(observed.starts_with("GET http://direct-test.invalid/reconnected HTTP/1.1\r\n"));
 
     reconnected
         .shutdown()
@@ -271,7 +252,7 @@ async fn handle_mock_http_connection(mut stream: TcpStream, observed: mpsc::Send
     } else {
         stream
             .write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nserver2-ok",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\ndirect-ok",
             )
             .await
             .expect("mock HTTP response failed");
@@ -347,7 +328,7 @@ async fn exercise_http_connect(
             .as_bytes(),
         )
         .await
-        .expect("failed to send CONNECT through server2 loopback");
+        .expect("failed to send CONNECT through direct loopback");
     let response = read_headers(&mut client).await;
     assert!(response.starts_with(b"HTTP/1.1 200"));
     client
@@ -437,7 +418,8 @@ async fn exercise_socks_domain(
 
 fn spawn_local_forward(
     ssh_executable: &std::path::Path,
-    host: &str,
+    target: &SshTarget,
+    identity_file: &std::path::Path,
     http_local_port: u16,
     http_remote_port: u16,
     socks_local_port: u16,
@@ -446,6 +428,8 @@ fn spawn_local_forward(
     let mut command = Command::new(ssh_executable);
     command
         .args([
+            "-F",
+            "/dev/null",
             "-N",
             "-T",
             "-o",
@@ -464,13 +448,48 @@ fn spawn_local_forward(
             "ControlMaster=no",
             "-o",
             "ControlPath=none",
-            "-L",
-            &format!("127.0.0.1:{http_local_port}:127.0.0.1:{http_remote_port}"),
-            "-L",
-            &format!("127.0.0.1:{socks_local_port}:127.0.0.1:{socks_remote_port}"),
-            "--",
-            host,
         ])
+        .arg("-p")
+        .arg(target.port.to_string())
+        .arg("-l")
+        .arg(&target.user)
+        .arg("-i")
+        .arg(identity_file)
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg("IdentityAgent=none")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg(format!(
+            "UserKnownHostsFile={}",
+            target.known_hosts.display()
+        ))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg("CanonicalizeHostname=no")
+        .arg("-o")
+        .arg("ProxyCommand=none")
+        .arg("-o")
+        .arg("ProxyJump=none")
+        .arg("-o")
+        .arg("KnownHostsCommand=none")
+        .arg("-L")
+        .arg(format!(
+            "127.0.0.1:{http_local_port}:127.0.0.1:{http_remote_port}"
+        ))
+        .arg("-L")
+        .arg(format!(
+            "127.0.0.1:{socks_local_port}:127.0.0.1:{socks_remote_port}"
+        ))
+        .arg("--")
+        .arg(&target.host)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -478,7 +497,27 @@ fn spawn_local_forward(
         .kill_on_drop(true);
     command
         .spawn()
-        .expect("failed to start server2 local-forward process")
+        .expect("failed to start direct local-forward process")
+}
+
+fn direct_target_from_env() -> SshTarget {
+    SshTarget {
+        host: required_env(HOST_ENV),
+        port: required_port(PORT_ENV),
+        user: required_env(USER_ENV),
+        known_hosts: PathBuf::from(required_env(KNOWN_HOSTS_ENV)),
+        connect_timeout: Duration::from_secs(10),
+    }
+}
+
+fn required_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("missing {name}"))
+}
+
+fn required_port(name: &str) -> u16 {
+    required_env(name)
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("{name} must be a valid SSH port"))
 }
 
 async fn send_http_request(local_forward: &mut Child, port: u16, request: &str) -> Vec<u8> {
@@ -551,7 +590,7 @@ async fn assert_reverse_forward_gone(local_forward: &mut Child, port: u16, autho
         .await
         .expect("local-forward listener disappeared unexpectedly");
     let request = format!(
-        "GET http://server2-test.invalid/must-be-gone HTTP/1.1\r\nHost: server2-test.invalid\r\nProxy-Authorization: Basic {authorization}\r\nConnection: close\r\n\r\n"
+        "GET http://direct-test.invalid/must-be-gone HTTP/1.1\r\nHost: direct-test.invalid\r\nProxy-Authorization: Basic {authorization}\r\nConnection: close\r\n\r\n"
     );
     if client.write_all(request.as_bytes()).await.is_err() {
         return;
@@ -617,7 +656,7 @@ async fn choose_distinct_local_ports() -> (u16, u16) {
 
 async fn connect_local(child: &mut Child, port: u16) -> TcpStream {
     if let Some(status) = child.try_wait().expect("failed to inspect local SSH") {
-        panic!("server2 local-forward SSH exited unexpectedly: {status}");
+        panic!("direct local-forward SSH exited unexpectedly: {status}");
     }
     timeout(
         Duration::from_secs(5),
@@ -632,7 +671,7 @@ async fn wait_for_local_forward(child: &mut Child, port: u16) -> TcpStream {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(status) = child.try_wait().expect("failed to inspect local SSH") {
-            panic!("server2 local-forward SSH exited before readiness: {status}");
+            panic!("direct local-forward SSH exited before readiness: {status}");
         }
         if let Ok(stream) = TcpStream::connect(("127.0.0.1", port)).await {
             return stream;

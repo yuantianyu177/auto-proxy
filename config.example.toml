@@ -1,0 +1,34 @@
+# ap configuration example. Copy this file to:
+#   ${XDG_CONFIG_HOME:-$HOME/.config}/ap/config.toml
+#
+# ap does not expand '~' or environment variables in TOML paths. Replace every
+# example path with an absolute path for the local machine.
+
+version = 2
+
+# Key authentication.
+[connections.dev.ssh]
+host = "dev.example.com"
+port = 22
+user = "alice"
+connect_timeout_seconds = 15
+identity_file = "/home/alice/.ssh/id_ed25519"
+
+[[connections.dev.proxies]]
+protocol = "mixed"
+local = "127.0.0.1:7890"
+remote_port = 17890
+
+# Password authentication. Omitting identity_file makes ap read the password
+# without echo from /dev/tty on every explicit start or restart. The password
+# is cleared immediately after the first authentication attempt. Password
+# connections end instead of reconnecting after SSH disconnects.
+[connections.password-dev.ssh]
+host = "password.example.com"
+port = 2222
+user = "alice"
+
+[[connections.password-dev.proxies]]
+protocol = "socks5"
+local = "[::1]:7891"
+remote_port = 17891

@@ -76,21 +76,29 @@ jobs:
       AP_CI_FORWARDING_DENIED_SSH_PORT: "22223"
       AP_CI_LISTEN_DENIED_SSH_PORT: "22224"
       AP_CI_PASSWORD_SSH_PORT: "22225"
-      AP_SERVER2_TEST_HOST: ap-ci-isolated
-      AP_RUN_SERVER2_TEST: "1"
+      AP_RUN_DIRECT_SSH_DEV_TEST: "1"
+      AP_DIRECT_SSH_DEV_HOST: "192.0.2.2"
+      AP_DIRECT_SSH_DEV_PORT: "22222"
+      AP_DIRECT_SSH_DEV_USER: ap_ci_tunnel
       AP_RUN_SSH_POLICY_TEST: "1"
-      AP_SSH_POLICY_PROBE_HOST: ap-ci-isolated
-      AP_SSH_POLICY_FORWARDING_DENIED_HOST: ap-ci-no-forwarding
-      AP_SSH_POLICY_LISTEN_DENIED_HOST: ap-ci-listen-denied
+      AP_SSH_POLICY_HOST: "192.0.2.2"
+      AP_SSH_POLICY_USER: ap_ci_tunnel
+      AP_SSH_POLICY_PROBE_SSH_PORT: "22222"
+      AP_SSH_POLICY_FORWARDING_DENIED_SSH_PORT: "22223"
+      AP_SSH_POLICY_LISTEN_DENIED_SSH_PORT: "22224"
       AP_SSH_POLICY_FORWARDING_DENIED_PORT: "47101"
       AP_SSH_POLICY_LISTEN_DENIED_PORT: "47102"
       AP_SSH_POLICY_CONFLICT_PORT: "47103"
       AP_CI_UNUSED_PERMITTED_PORT: "47104"
       AP_RUN_THROUGHPUT_TEST: "1"
-      AP_THROUGHPUT_SSH_HOST: ap-ci-isolated
+      AP_THROUGHPUT_SSH_HOST: "192.0.2.2"
+      AP_THROUGHPUT_SSH_PORT: "22222"
+      AP_THROUGHPUT_SSH_USER: ap_ci_tunnel
       AP_ENFORCE_THROUGHPUT: ${{ inputs.enforce_throughput && '1' || '0' }}
       AP_RUN_OPENSSH_PASSWORD_TEST: "1"
-      AP_TEST_SSH_PASSWORD_HOST: ap-ci-password-only
+      AP_TEST_SSH_PASSWORD_HOST: "192.0.2.2"
+      AP_TEST_SSH_PASSWORD_PORT: "22225"
+      AP_TEST_SSH_PASSWORD_USER: ap_ci_tunnel
     steps:
       - uses: actions/checkout@v4
       - name: Install isolated sshd prerequisites
@@ -104,7 +112,6 @@ jobs:
           test_dir="$(mktemp -d "${RUNNER_TEMP}/ap-sshd.XXXXXX")"
           chmod 700 "$test_dir"
           echo "AP_CI_DIR=$test_dir" >> "$GITHUB_ENV"
-          echo "AP_CI_SSH_CONFIG=${HOME}/.ssh/config" >> "$GITHUB_ENV"
       - name: Create ordinary SSH login user and ephemeral keys
         run: |
           set -euo pipefail
@@ -122,16 +129,17 @@ jobs:
           fi
 
           # One random account credential is shared only with the password-only
-          # fixture. Other aliases disable password login. Only the path to its
-          # private file is exported; the value never enters argv, env, or logs.
+          # fixture. The other sshd fixtures disable password login. Only the
+          # path to its private file is exported; the value never enters argv,
+          # env, or logs.
           account_password="$(openssl rand -hex 32)"
-          password_file="$AP_CI_DIR/account-password"
-          (umask 077; printf '%s' "$account_password" > "$password_file")
-          chmod 600 "$password_file"
-          echo "AP_TEST_SSH_PASSWORD_FILE=$password_file" >> "$GITHUB_ENV"
+          password_fixture="$AP_CI_DIR/account-password"
+          (umask 077; printf '%s' "$account_password" > "$password_fixture")
+          chmod 600 "$password_fixture"
+          echo "AP_TEST_SSH_PASSWORD_FIXTURE_PATH=$password_fixture" >> "$GITHUB_ENV"
           account_password_hash="$(printf '%s' "$account_password" | openssl passwd -6 -stdin)"
           unset account_password
-          unset password_file
+          unset password_fixture
           printf '%s:%s\n' "$AP_CI_TEST_USER" "$account_password_hash" \
             | sudo chpasswd --encrypted
           unset account_password_hash
@@ -145,7 +153,6 @@ jobs:
           sudo install -m 600 -o "$AP_CI_TEST_USER" -g "$AP_CI_TEST_USER" \
             "$AP_CI_DIR/authorized_keys" "/home/$AP_CI_TEST_USER/.ssh/authorized_keys"
 
-          install -d -m 700 "$HOME/.ssh"
           host_public_key="$(cut -d ' ' -f 1,2 "$AP_CI_DIR/host-key.pub")"
           {
             for port in \
@@ -158,37 +165,13 @@ jobs:
             done
           } > "$AP_CI_DIR/known_hosts"
           chmod 600 "$AP_CI_DIR/known_hosts"
-          write_ssh_host() {
-            alias=$1
-            port=$2
-            printf 'Host %s\n' "$alias"
-            printf '  HostName %s\n' "$AP_CI_SSH_ADDR"
-            printf '  Port %s\n' "$port"
-            printf '  User %s\n' "$AP_CI_TEST_USER"
-            printf '  IdentityFile %s\n' "$AP_CI_DIR/client-key"
-            printf '  UserKnownHostsFile %s\n' "$AP_CI_DIR/known_hosts"
-            printf '  IdentitiesOnly yes\n'
-            printf '  IdentityAgent none\n'
-            printf '  PasswordAuthentication no\n'
-            printf '  KbdInteractiveAuthentication no\n'
-            printf '  StrictHostKeyChecking yes\n'
-            printf '  AddressFamily inet\n'
-            printf '  ConnectTimeout 10\n'
-            printf '  LogLevel ERROR\n'
-          }
-          {
-            write_ssh_host "$AP_SERVER2_TEST_HOST" "$AP_CI_SSH_PORT"
-            write_ssh_host \
-              "$AP_SSH_POLICY_FORWARDING_DENIED_HOST" \
-              "$AP_CI_FORWARDING_DENIED_SSH_PORT"
-            write_ssh_host \
-              "$AP_SSH_POLICY_LISTEN_DENIED_HOST" \
-              "$AP_CI_LISTEN_DENIED_SSH_PORT"
-            write_ssh_host \
-              "$AP_TEST_SSH_PASSWORD_HOST" \
-              "$AP_CI_PASSWORD_SSH_PORT"
-          } > "$AP_CI_SSH_CONFIG"
-          chmod 600 "$AP_CI_SSH_CONFIG"
+          echo "AP_DIRECT_SSH_DEV_IDENTITY_FILE=$AP_CI_DIR/client-key" >> "$GITHUB_ENV"
+          echo "AP_DIRECT_SSH_DEV_KNOWN_HOSTS=$AP_CI_DIR/known_hosts" >> "$GITHUB_ENV"
+          echo "AP_SSH_POLICY_IDENTITY_FILE=$AP_CI_DIR/client-key" >> "$GITHUB_ENV"
+          echo "AP_SSH_POLICY_KNOWN_HOSTS=$AP_CI_DIR/known_hosts" >> "$GITHUB_ENV"
+          echo "AP_THROUGHPUT_SSH_IDENTITY_FILE=$AP_CI_DIR/client-key" >> "$GITHUB_ENV"
+          echo "AP_THROUGHPUT_SSH_KNOWN_HOSTS=$AP_CI_DIR/known_hosts" >> "$GITHUB_ENV"
+          echo "AP_TEST_SSH_PASSWORD_KNOWN_HOSTS=$AP_CI_DIR/known_hosts" >> "$GITHUB_ENV"
       - name: Start network-isolated sshd
         run: |
           set -euo pipefail
@@ -326,7 +309,7 @@ jobs:
           key: isolated-sshd-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: isolated-sshd-${{ runner.os }}-
       - name: Run reverse-forward integration test
-        run: cargo test --locked --test server2_dev -- --ignored --nocapture
+        run: cargo test --locked --test direct_ssh_dev -- --ignored --nocapture
       - name: Run sshd policy and cleanup integration test
         run: cargo test --locked --test sshd_policy_ci -- --ignored --nocapture
       - name: Run real password-only OpenSSH AskPass integration test
@@ -354,9 +337,6 @@ jobs:
           fi
           if test -n "${AP_CI_DIR:-}" && test -f "$AP_CI_DIR/user-created"; then
             sudo userdel --remove "$AP_CI_TEST_USER" 2>/dev/null || true
-          fi
-          if test -n "${AP_CI_SSH_CONFIG:-}"; then
-            rm -f -- "$AP_CI_SSH_CONFIG"
           fi
           case "${AP_CI_DIR:-}" in
             "$RUNNER_TEMP"/ap-sshd.*) rm -rf -- "$AP_CI_DIR" ;;

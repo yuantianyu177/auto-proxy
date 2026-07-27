@@ -55,7 +55,7 @@ struct Request {
     parent_pid: u32,
 }
 
-/// Environment additions required by OpenSSH for a stored-password attempt.
+/// Environment additions required by an OpenSSH password attempt.
 #[derive(Clone, Debug)]
 pub struct AskpassEnvironment {
     pub socket: PathBuf,
@@ -190,7 +190,7 @@ pub fn maybe_run_from_env() -> Result<bool> {
 
     // With LC_ALL=C on the SSH process, a password request contains this word.
     // Rejecting every other prompt is a final guard against host-key and key
-    // passphrase prompts reaching the stored SSH password.
+    // passphrase prompts reaching the in-memory SSH password.
     let prompt = std::env::args_os().nth(1).unwrap_or_default();
     if !prompt
         .to_string_lossy()
@@ -307,19 +307,19 @@ async fn serve_once(
     let password = match tokio::task::spawn_blocking(move || (password_provider)()).await {
         Ok(Ok(password)) => password,
         Ok(Err(error)) => {
-            send_rejection(&mut stream, "stored credential is unavailable").await?;
+            send_rejection(&mut stream, "SSH password is unavailable").await?;
             return Err(error);
         }
         Err(error) => {
-            send_rejection(&mut stream, "stored credential is unavailable").await?;
+            send_rejection(&mut stream, "SSH password is unavailable").await?;
             return Err(ApError::coded("AP_ASKPASS_TASK", error.to_string()));
         }
     };
     if password.len() > MAX_PASSWORD {
-        send_rejection(&mut stream, "stored password is too large").await?;
+        send_rejection(&mut stream, "SSH password is too large").await?;
         return Err(ApError::coded(
             "AP_ASKPASS_PASSWORD_SIZE",
-            "stored password is too large",
+            "SSH password is too large",
         ));
     }
     stream.write_all(&[0]).await?;
@@ -448,7 +448,7 @@ fn peer_identity(stream: &UnixStream) -> Result<PeerIdentity> {
     if token_result != 0 || token_length as usize != std::mem::size_of_val(&audit_token) {
         return Err(ApError::coded(
             "AP_ASKPASS_PEER",
-            "无法取得 AskPass peer 的 macOS audit token",
+            "Cannot read the AskPass peer audit token",
         ));
     }
     Ok(PeerIdentity {
@@ -538,7 +538,7 @@ unsafe extern "C" {
 /// Bind a macOS AskPass peer to the code-signing identity of the already
 /// running broker, rather than only to a replaceable pathname. Both the
 /// designated requirement and the exact CDHash must match. Thus replacing
-/// `ap` after daemon startup cannot turn a different binary at the same path
+/// `ap` after supervisor startup cannot turn a different binary at the same path
 /// into an authorized helper, including an older legitimately signed release.
 #[cfg(target_os = "macos")]
 fn audit_token_code_matches_current(audit_token: &[u32; 8]) -> bool {

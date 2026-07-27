@@ -28,7 +28,7 @@ if [[ ! -f "${binary}" || -L "${binary}" || ! -x "${binary}" ]]; then
   exit 1
 fi
 
-for document in README.md RELEASING.md LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md; do
+for document in README.md RELEASING.md LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md config.example.toml; do
   if [[ ! -f "${document}" || -L "${document}" ]]; then
     echo "required release document must be a regular, non-symlink file: ${document}" >&2
     exit 1
@@ -75,7 +75,7 @@ fi
 
 mkdir -p "${staging_root}/${archive_base}"
 install -m 0755 "${binary}" "${staging_root}/${archive_base}/ap"
-for document in README.md RELEASING.md LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md; do
+for document in README.md RELEASING.md LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md config.example.toml; do
   install -m 0644 "${document}" "${staging_root}/${archive_base}/${document}"
 done
 

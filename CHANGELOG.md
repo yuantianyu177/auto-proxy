@@ -6,29 +6,38 @@
 
 ### Added
 
-- Rust 单二进制 CLI、用户级 daemon IPC 和 macOS/Linux 服务定义。
-- OpenSSH 多路反向转发、ControlMaster、AskPass 系统凭据库集成。
-- 带认证的 HTTP、SOCKS5 和 mixed 本机代理网关。
-- profile、映射、代理凭据、环境变量与 doctor 管理命令。
-- Linux musl/macOS 四目标发布流水线、Developer ID 签名门禁、SBOM 与 SHA-256 校验清单。
-- OpenSSH 父进程 watchdog；即使持有连接的 `ap` 被 `SIGKILL`，也会终止并回收 SSH 子进程，释放远端监听。
-- 无外网/公共 DNS 的隔离 sshd 测试夹具、password-only AskPass 测试、转发策略/端口冲突覆盖、`server2` 人工开发测试和可选吞吐门禁。
-- macOS Keychain/Linux Secret Service 的显式真实 CRUD 测试，以及 Linux 无会话 D-Bus 时禁止明文文件回退的自动测试。
-- 不含秘密值的跨存储事务日志与启动恢复，覆盖 server 和 SSH 密码的新增/删除崩溃窗口。
+- 全新的 v2 用户配置格式。connection 直接定义 SSH `host`、`user`、`port`、可选 `identity_file` 与任意数量的无名称 HTTP、SOCKS5 或 mixed proxy mappings。
+- 扁平 SSH 认证：存在 `identity_file` 时使用密钥，省略时在每次显式启动或重启时从 `/dev/tty` 无回显读取密码。
+- 扁平 CLI：通过 `ap <connection>` 连接，并以 `-f`、`-d`、`-r`、`-c`、`-l`、`-v` 和 `-h` 完成全部公开操作。
+- 默认后台 supervisor 和显式前台模式；无需安装用户服务。
+- 每次显式新建或重启 connection 时自动生成新的远端代理凭据，并在成功后输出远端环境变量。
+- macOS 与 Linux 统一采用 `XDG_CONFIG_HOME`、`XDG_STATE_HOME` 和 `XDG_RUNTIME_DIR`，并提供安全的 runtime fallback。
+- 独立的 XDG `known_hosts`、OpenSSH ControlMaster、父进程 watchdog，以及密钥 connection 的网络故障自动重连。
+- 带认证的 HTTP、SOCKS5 与 mixed 本机网关，以及 Linux musl/macOS 四目标发布、SBOM 和 SHA-256 校验流水线。
 
-### Fixed
+### Changed
 
-- macOS 默认将 OpenSSH ControlMaster socket 放入当前 UID 专属的短路径私有运行目录，避免 `~/Library/Application Support` 加上 OpenSSH 临时后缀后超过 Unix socket 路径上限而产生 `AP_SSH_EXITED`。
+- SSH 参数完全由 ap v2 配置提供，不读取或复用 `~/.ssh/config`。
+- 运行中的 connection 使用不可变配置快照。编辑配置只影响后续显式连接或重启。
+- 显式重启会刷新代理凭据；密钥 connection 在同一 lifecycle 内自动断线重连时继续使用原配置快照和原凭据。
+- SSH 密码只在首次认证期间短暂驻留受控内存并在认证结束后立即清除。密码 connection 断线后结束且不自动重连，再次显式启动或重启会重新提示。
+- 所有终端输出、help、错误和运行日志统一为简洁英文。
+- 配置完全由用户手写；程序只读取、验证并解析配置，不修改或打印配置内容。
 
 ### Security
 
-- stored-password 模式仅信任 root-owned 且普通用户不可替换的系统 OpenSSH，并拒绝可继承 AskPass 环境的 SSH 本地 helper。
-- macOS 将 watchdog/AskPass 绑定到 socket audit token（含 pid-version）、运行中 daemon 的 designated code requirement 和内核返回的 exact running CDHash，阻止同路径热替换或使用同一签名身份的旧版本降级绕过 Keychain 访问边界。升级后需重启 daemon；profile UUID、Keychain item 与 Developer ID 稳定标识 `dev.approxy.ap` 保持不变。
-- 已校验的 OpenSSH effective config 通过匿名 stdin 管道交给实际连接，避免可替换的配置快照路径。
-- SSH 密码、自动生成的代理凭据、daemon IPC、运行锁、服务定义和日志采用彼此独立的存储与权限边界。
-- 发布脚本使用原子输出、拒绝符号链接输入，并精确校验校验清单和压缩包成员；macOS 打包禁用 AppleDouble 元数据文件。
-- 进程在读取凭据前禁用自身及 OpenSSH 子进程的 core dump；HTTP 上游连接和响应头阶段均受握手期限约束，超时会释放连接任务。
+- 远端转发固定监听 `127.0.0.1`，本机上游端点仅允许 `127.0.0.1` 或 `::1`。
+- 每个 connection lifecycle 使用独立的随机 HTTP Basic/SOCKS5 RFC 1929 凭据；秘密不进入配置、argv、日志或连接列表。
+- SSH 密码不能通过 CLI、环境变量、标准输入或配置文件提供，也不进入磁盘、状态、日志、OpenSSH argv 或环境；它通过一次性 AskPass 通道传递给受信任的系统 OpenSSH。
+- SSH identity file、XDG 目录、运行 socket、known_hosts 与 ControlMaster 路径均进行所有权和权限校验。
+- 用户 SSH 配置中的 alias、forward、local command、`ProxyJump` 和 `ProxyCommand` 无法影响 ap 连接。
+- SSH agent forwarding、X11 forwarding 和远端命令被禁用；host-key 校验保持开启。
+- HTTP 转发前移除认证与 hop-by-hop headers，SOCKS5 只允许 CONNECT；日志不记录目标、正文或秘密。
 
-### Testing notes
+### Testing
 
-- 真实 Keychain/Secret Service、真实 `systemd --user`/LaunchAgent、Developer ID 签名与四个发布目标仍须以各目标环境或 GitHub Actions 的实际运行结果为发布依据；本条只记录测试入口和发布门禁已经加入仓库。
+- 配置解析覆盖 v2 schema、未知字段、密钥与交互密码选择、路径权限、loopback 限制和重复端口。
+- CLI 解析覆盖扁平动作、作用域、互斥选项、英文 help/version、无保留字的 connection 名，以及在读取配置前拒绝并隐藏密码参数值。
+- 隔离 sshd 测试不依赖远端互联网、公共 DNS、root 登录或远端软件，并覆盖转发策略、端口冲突、断线恢复和资源清理。
+- 生命周期测试区分密钥与密码连接：前者自动重连，后者在首次认证后清除密码并于断线时结束。
+- 协议测试覆盖 HTTP、CONNECT、SOCKS5、mixed、认证失败、32 路并发、大流量和半关闭传播。

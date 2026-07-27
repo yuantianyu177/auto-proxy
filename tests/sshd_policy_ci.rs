@@ -1,16 +1,20 @@
 //! Opt-in integration coverage for remote-forward policy failures.
 //!
-//! The CI workflow supplies three OpenSSH Host aliases backed by ordinary-user
-//! sshd instances in one network namespace: a probe server, a server with all
+//! The CI workflow supplies three explicit ordinary-user SSH destinations in
+//! one network namespace: a probe server, a server with all
 //! TCP forwarding disabled, and a server whose `PermitListen` excludes the
 //! requested port. Every SSH process in this test uses `-N -T`; no remote
 //! command, shell, installation, Internet access, or DNS is required.
 
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use auto_proxy::{
     gateway::{GatewayCredential, GatewayProtocol, RunningGateway, start_gateway},
-    ssh::{RemoteForward, SshAuthentication, SshMaster, SshOptions, system_ssh_executable},
+    ssh::{RemoteForward, SshAuth, SshMaster, SshOptions, SshTarget, system_ssh_executable},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -21,9 +25,13 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const RUN_ENV: &str = "AP_RUN_SSH_POLICY_TEST";
-const PROBE_HOST_ENV: &str = "AP_SSH_POLICY_PROBE_HOST";
-const FORWARDING_DENIED_HOST_ENV: &str = "AP_SSH_POLICY_FORWARDING_DENIED_HOST";
-const LISTEN_DENIED_HOST_ENV: &str = "AP_SSH_POLICY_LISTEN_DENIED_HOST";
+const HOST_ENV: &str = "AP_SSH_POLICY_HOST";
+const USER_ENV: &str = "AP_SSH_POLICY_USER";
+const IDENTITY_ENV: &str = "AP_SSH_POLICY_IDENTITY_FILE";
+const KNOWN_HOSTS_ENV: &str = "AP_SSH_POLICY_KNOWN_HOSTS";
+const PROBE_SSH_PORT_ENV: &str = "AP_SSH_POLICY_PROBE_SSH_PORT";
+const FORWARDING_DENIED_SSH_PORT_ENV: &str = "AP_SSH_POLICY_FORWARDING_DENIED_SSH_PORT";
+const LISTEN_DENIED_SSH_PORT_ENV: &str = "AP_SSH_POLICY_LISTEN_DENIED_SSH_PORT";
 const FORWARDING_DENIED_PORT_ENV: &str = "AP_SSH_POLICY_FORWARDING_DENIED_PORT";
 const LISTEN_DENIED_PORT_ENV: &str = "AP_SSH_POLICY_LISTEN_DENIED_PORT";
 const CONFLICT_PORT_ENV: &str = "AP_SSH_POLICY_CONFLICT_PORT";
@@ -36,9 +44,9 @@ async fn remote_forward_policy_failures_leave_no_resources() {
         return;
     }
 
-    let probe_host = required_alias(PROBE_HOST_ENV);
-    let forwarding_denied_host = required_alias(FORWARDING_DENIED_HOST_ENV);
-    let listen_denied_host = required_alias(LISTEN_DENIED_HOST_ENV);
+    let probe_target = key_target_from_env(PROBE_SSH_PORT_ENV);
+    let forwarding_denied_target = key_target_from_env(FORWARDING_DENIED_SSH_PORT_ENV);
+    let listen_denied_target = key_target_from_env(LISTEN_DENIED_SSH_PORT_ENV);
     let forwarding_denied_port = required_port(FORWARDING_DENIED_PORT_ENV);
     let listen_denied_port = required_port(LISTEN_DENIED_PORT_ENV);
     let conflict_port = required_port(CONFLICT_PORT_ENV);
@@ -47,14 +55,10 @@ async fn remote_forward_policy_failures_leave_no_resources() {
     assert_ne!(listen_denied_port, conflict_port);
 
     let executable = system_ssh_executable().expect("trusted system OpenSSH is unavailable");
-    verify_alias(&executable, &probe_host).await;
-    verify_alias(&executable, &forwarding_denied_host).await;
-    verify_alias(&executable, &listen_denied_host).await;
-
     let local_ports = choose_local_ports(3).await;
     let mut probe = spawn_probe_forward(
         &executable,
-        &probe_host,
+        &probe_target,
         &[
             (local_ports[0], forwarding_denied_port),
             (local_ports[1], listen_denied_port),
@@ -66,7 +70,7 @@ async fn remote_forward_policy_failures_leave_no_resources() {
     let temporary = tempfile::tempdir().expect("failed to create private test directory");
     assert_remote_closed(&mut probe, local_ports[0]).await;
     exercise_policy_rejection(
-        &forwarding_denied_host,
+        &forwarding_denied_target,
         forwarding_denied_port,
         local_ports[0],
         &temporary.path().join("forwarding-denied.sock"),
@@ -76,7 +80,7 @@ async fn remote_forward_policy_failures_leave_no_resources() {
 
     assert_remote_closed(&mut probe, local_ports[1]).await;
     exercise_policy_rejection(
-        &listen_denied_host,
+        &listen_denied_target,
         listen_denied_port,
         local_ports[1],
         &temporary.path().join("listen-denied.sock"),
@@ -85,7 +89,7 @@ async fn remote_forward_policy_failures_leave_no_resources() {
     .await;
 
     exercise_fixed_port_conflict(
-        &probe_host,
+        &probe_target,
         conflict_port,
         local_ports[2],
         temporary.path(),
@@ -98,7 +102,7 @@ async fn remote_forward_policy_failures_leave_no_resources() {
 }
 
 async fn exercise_policy_rejection(
-    host: &str,
+    target: &DirectKeyTarget,
     remote_port: u16,
     probe_port: u16,
     control_socket: &Path,
@@ -108,7 +112,7 @@ async fn exercise_policy_rejection(
     let gateway_addr = gateway.listen_addr;
     assert_gateway_open(gateway_addr).await;
 
-    let options = options(host, remote_port, gateway_addr, control_socket);
+    let options = options(target, remote_port, gateway_addr, control_socket);
     match timeout(Duration::from_secs(10), SshMaster::start(options)).await {
         Ok(Err(error)) => assert_forward_rejection(&error),
         Ok(Ok(master)) => {
@@ -126,7 +130,7 @@ async fn exercise_policy_rejection(
 }
 
 async fn exercise_fixed_port_conflict(
-    host: &str,
+    target: &DirectKeyTarget,
     remote_port: u16,
     probe_port: u16,
     directory: &Path,
@@ -139,9 +143,14 @@ async fn exercise_fixed_port_conflict(
 
     let (_occupant_upstream, occupant_gateway) = new_gateway("conflict-occupant").await;
     let occupant_addr = occupant_gateway.listen_addr;
-    let occupant = SshMaster::start(options(host, remote_port, occupant_addr, &occupant_control))
-        .await
-        .expect("failed to create the intentional remote-port occupant");
+    let occupant = SshMaster::start(options(
+        target,
+        remote_port,
+        occupant_addr,
+        &occupant_control,
+    ))
+    .await
+    .expect("failed to create the intentional remote-port occupant");
     assert!(
         occupant_control.exists(),
         "occupant control socket is missing"
@@ -154,7 +163,7 @@ async fn exercise_fixed_port_conflict(
     match timeout(
         Duration::from_secs(10),
         SshMaster::start(options(
-            host,
+            target,
             remote_port,
             challenger_addr,
             &challenger_control,
@@ -189,7 +198,7 @@ async fn exercise_fixed_port_conflict(
     let (_recovered_upstream, recovered_gateway) = new_gateway("conflict-recovered").await;
     let recovered_addr = recovered_gateway.listen_addr;
     let recovered = SshMaster::start(options(
-        host,
+        target,
         remote_port,
         recovered_addr,
         &recovered_control,
@@ -219,19 +228,21 @@ fn assert_forward_rejection(error: &auto_proxy::error::ApError) {
 }
 
 fn options(
-    host: &str,
+    target: &DirectKeyTarget,
     remote_port: u16,
     gateway: std::net::SocketAddr,
     control_socket: &Path,
 ) -> SshOptions {
     let mut options = SshOptions::new(
-        host,
+        target.target.clone(),
         control_socket.to_owned(),
         vec![RemoteForward {
             remote_port,
             local_gateway: gateway,
         }],
-        SshAuthentication::SshConfig { batch_mode: true },
+        SshAuth::Key {
+            identity_file: target.identity_file.clone(),
+        },
     )
     .expect("failed to construct SSH options")
     .with_ap_executable(env!("CARGO_BIN_EXE_ap"));
@@ -255,23 +266,16 @@ async fn new_gateway(name: &str) -> (TcpListener, RunningGateway) {
     (upstream, gateway)
 }
 
-async fn verify_alias(executable: &Path, host: &str) {
-    let status = Command::new(executable)
-        .args(["-G", "--", host])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .expect("failed to run ssh -G");
-    assert!(status.success(), "isolated SSH Host alias is invalid");
-}
-
-fn spawn_probe_forward(executable: &Path, host: &str, forwards: &[(u16, u16)]) -> Child {
+fn spawn_probe_forward(
+    executable: &Path,
+    target: &DirectKeyTarget,
+    forwards: &[(u16, u16)],
+) -> Child {
     let mut command = Command::new(executable);
     command
         .args([
+            "-F",
+            "/dev/null",
             "-N",
             "-T",
             "-o",
@@ -291,6 +295,37 @@ fn spawn_probe_forward(executable: &Path, host: &str, forwards: &[(u16, u16)]) -
             "-o",
             "ControlPath=none",
         ])
+        .arg("-p")
+        .arg(target.target.port.to_string())
+        .arg("-l")
+        .arg(&target.target.user)
+        .arg("-i")
+        .arg(&target.identity_file)
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg("IdentityAgent=none")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg(format!(
+            "UserKnownHostsFile={}",
+            target.target.known_hosts.display()
+        ))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg("CanonicalizeHostname=no")
+        .arg("-o")
+        .arg("ProxyCommand=none")
+        .arg("-o")
+        .arg("ProxyJump=none")
+        .arg("-o")
+        .arg("KnownHostsCommand=none")
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -301,7 +336,7 @@ fn spawn_probe_forward(executable: &Path, host: &str, forwards: &[(u16, u16)]) -
             .arg("-L")
             .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"));
     }
-    command.arg("--").arg(host);
+    command.arg("--").arg(&target.target.host);
     command
         .spawn()
         .expect("failed to start isolated remote-listener probe")
@@ -425,17 +460,33 @@ async fn choose_local_ports(count: usize) -> Vec<u16> {
     ports
 }
 
-fn required_alias(name: &str) -> String {
-    let value = std::env::var(name).unwrap_or_else(|_| panic!("missing {name}"));
-    assert!(
-        !value.is_empty()
-            && value.len() <= 255
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
-        "{name} is not a plain OpenSSH Host alias"
-    );
-    value
+#[derive(Clone)]
+struct DirectKeyTarget {
+    target: SshTarget,
+    identity_file: PathBuf,
+}
+
+fn key_target_from_env(port_env: &str) -> DirectKeyTarget {
+    DirectKeyTarget {
+        target: SshTarget {
+            host: required_env(HOST_ENV),
+            port: required_ssh_port(port_env),
+            user: required_env(USER_ENV),
+            known_hosts: PathBuf::from(required_env(KNOWN_HOSTS_ENV)),
+            connect_timeout: Duration::from_secs(10),
+        },
+        identity_file: PathBuf::from(required_env(IDENTITY_ENV)),
+    }
+}
+
+fn required_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("missing {name}"))
+}
+
+fn required_ssh_port(name: &str) -> u16 {
+    required_env(name)
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("invalid SSH port in {name}"))
 }
 
 fn required_port(name: &str) -> u16 {

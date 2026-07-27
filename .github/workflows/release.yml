@@ -194,7 +194,7 @@ jobs:
           merge-multiple: true
       - name: Generate CycloneDX SBOM
         run: |
-          install -m 0644 README.md LICENSE CHANGELOG.md dist/
+          install -m 0644 README.md LICENSE CHANGELOG.md config.example.toml dist/
           bash scripts/generate-sbom.sh \
             "${{ needs.prepare.outputs.version }}" \
             "dist/ap-v${{ needs.prepare.outputs.version }}-sbom.cdx.json"

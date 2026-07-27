@@ -8,7 +8,7 @@
 
 use std::{
     io::{Error, ErrorKind},
-    path::Path,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::Duration,
@@ -16,7 +16,7 @@ use std::{
 
 use auto_proxy::{
     gateway::{GatewayCredential, GatewayProtocol, start_gateway},
-    ssh::{RemoteForward, SshAuthentication, SshMaster, SshOptions, system_ssh_executable},
+    ssh::{RemoteForward, SshAuth, SshMaster, SshOptions, SshTarget, system_ssh_executable},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use tokio::{
@@ -31,6 +31,10 @@ use tokio_util::sync::CancellationToken;
 
 const RUN_ENV: &str = "AP_RUN_THROUGHPUT_TEST";
 const HOST_ENV: &str = "AP_THROUGHPUT_SSH_HOST";
+const PORT_ENV: &str = "AP_THROUGHPUT_SSH_PORT";
+const USER_ENV: &str = "AP_THROUGHPUT_SSH_USER";
+const IDENTITY_ENV: &str = "AP_THROUGHPUT_SSH_IDENTITY_FILE";
+const KNOWN_HOSTS_ENV: &str = "AP_THROUGHPUT_SSH_KNOWN_HOSTS";
 const ENFORCE_ENV: &str = "AP_ENFORCE_THROUGHPUT";
 const CONNECTIONS_ENV: &str = "AP_THROUGHPUT_CONNECTIONS";
 const BYTES_ENV: &str = "AP_THROUGHPUT_BYTES_PER_CONNECTION";
@@ -65,7 +69,7 @@ async fn connect_gateway_throughput_tracks_raw_openssh() {
         return;
     }
 
-    let host = required_alias(HOST_ENV);
+    let target = key_target_from_env();
     let connections = bounded_env_usize(CONNECTIONS_ENV, DEFAULT_CONNECTIONS, 1, 128);
     let bytes_per_connection = bounded_env_usize(
         BYTES_ENV,
@@ -75,7 +79,6 @@ async fn connect_gateway_throughput_tracks_raw_openssh() {
     );
     let enforce = std::env::var(ENFORCE_ENV).as_deref() == Ok("1");
     let executable = system_ssh_executable().expect("trusted system OpenSSH is unavailable");
-    verify_alias(&executable, &host).await;
 
     let (echo_addr, echo_task) = spawn_echo_server().await;
     let (proxy_addr, proxy_task) = spawn_connect_echo_proxy().await;
@@ -95,11 +98,11 @@ async fn connect_gateway_throughput_tracks_raw_openssh() {
     let temporary = tempfile::tempdir().expect("failed to create private test directory");
     let raw_control = temporary.path().join("raw-master.sock");
     let gateway_control = temporary.path().join("gateway-master.sock");
-    let raw_master = SshMaster::start(options(&host, raw_remote_port, echo_addr, &raw_control))
+    let raw_master = SshMaster::start(options(&target, raw_remote_port, echo_addr, &raw_control))
         .await
         .expect("failed to establish raw baseline reverse forward");
     let gateway_master = SshMaster::start(options(
-        &host,
+        &target,
         gateway_remote_port,
         gateway_addr,
         &gateway_control,
@@ -110,7 +113,7 @@ async fn connect_gateway_throughput_tracks_raw_openssh() {
     let local_ports = choose_local_ports(2).await;
     let mut local_forward = spawn_local_forward(
         &executable,
-        &host,
+        &target,
         &[
             (local_ports[0], raw_remote_port),
             (local_ports[1], gateway_remote_port),
@@ -473,41 +476,36 @@ async fn read_headers(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
 }
 
 fn options(
-    host: &str,
+    target: &DirectKeyTarget,
     remote_port: u16,
     local_endpoint: std::net::SocketAddr,
     control_socket: &Path,
 ) -> SshOptions {
     SshOptions::new(
-        host,
+        target.target.clone(),
         control_socket.to_owned(),
         vec![RemoteForward {
             remote_port,
             local_gateway: local_endpoint,
         }],
-        SshAuthentication::SshConfig { batch_mode: true },
+        SshAuth::Key {
+            identity_file: target.identity_file.clone(),
+        },
     )
     .expect("failed to construct SSH options")
     .with_ap_executable(env!("CARGO_BIN_EXE_ap"))
 }
 
-async fn verify_alias(executable: &Path, host: &str) {
-    let status = Command::new(executable)
-        .args(["-G", "--", host])
-        .env("LC_ALL", "C")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .expect("failed to run ssh -G");
-    assert!(status.success(), "isolated SSH Host alias is invalid");
-}
-
-fn spawn_local_forward(executable: &Path, host: &str, forwards: &[(u16, u16)]) -> Child {
+fn spawn_local_forward(
+    executable: &Path,
+    target: &DirectKeyTarget,
+    forwards: &[(u16, u16)],
+) -> Child {
     let mut command = Command::new(executable);
     command
         .args([
+            "-F",
+            "/dev/null",
             "-N",
             "-T",
             "-o",
@@ -527,6 +525,37 @@ fn spawn_local_forward(executable: &Path, host: &str, forwards: &[(u16, u16)]) -
             "-o",
             "ControlPath=none",
         ])
+        .arg("-p")
+        .arg(target.target.port.to_string())
+        .arg("-l")
+        .arg(&target.target.user)
+        .arg("-i")
+        .arg(&target.identity_file)
+        .arg("-o")
+        .arg("IdentitiesOnly=yes")
+        .arg("-o")
+        .arg("IdentityAgent=none")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg(format!(
+            "UserKnownHostsFile={}",
+            target.target.known_hosts.display()
+        ))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg("CanonicalizeHostname=no")
+        .arg("-o")
+        .arg("ProxyCommand=none")
+        .arg("-o")
+        .arg("ProxyJump=none")
+        .arg("-o")
+        .arg("KnownHostsCommand=none")
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -537,7 +566,7 @@ fn spawn_local_forward(executable: &Path, host: &str, forwards: &[(u16, u16)]) -
             .arg("-L")
             .arg(format!("127.0.0.1:{local_port}:127.0.0.1:{remote_port}"));
     }
-    command.arg("--").arg(host);
+    command.arg("--").arg(&target.target.host);
     command
         .spawn()
         .expect("failed to start throughput local-forward SSH")
@@ -626,17 +655,33 @@ fn random_high_port() -> u16 {
     40_000 + (u16::from_ne_bytes(random) % 20_000)
 }
 
-fn required_alias(name: &str) -> String {
-    let value = std::env::var(name).unwrap_or_else(|_| panic!("missing {name}"));
-    assert!(
-        !value.is_empty()
-            && value.len() <= 255
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
-        "{name} is not a plain OpenSSH Host alias"
-    );
-    value
+#[derive(Clone)]
+struct DirectKeyTarget {
+    target: SshTarget,
+    identity_file: PathBuf,
+}
+
+fn key_target_from_env() -> DirectKeyTarget {
+    DirectKeyTarget {
+        target: SshTarget {
+            host: required_env(HOST_ENV),
+            port: required_ssh_port(PORT_ENV),
+            user: required_env(USER_ENV),
+            known_hosts: PathBuf::from(required_env(KNOWN_HOSTS_ENV)),
+            connect_timeout: Duration::from_secs(10),
+        },
+        identity_file: PathBuf::from(required_env(IDENTITY_ENV)),
+    }
+}
+
+fn required_env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("missing {name}"))
+}
+
+fn required_ssh_port(name: &str) -> u16 {
+    required_env(name)
+        .parse::<u16>()
+        .unwrap_or_else(|_| panic!("invalid SSH port in {name}"))
 }
 
 fn bounded_env_usize(name: &str, default: usize, minimum: usize, maximum: usize) -> usize {

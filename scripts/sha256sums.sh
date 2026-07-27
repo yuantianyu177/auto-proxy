@@ -18,6 +18,7 @@ if [[ ! -d "${bundle_directory}" || -L "${bundle_directory}" ]]; then
 fi
 files=(
   "CHANGELOG.md"
+  "config.example.toml"
   "LICENSE"
   "README.md"
   "ap-v${version}-aarch64-apple-darwin.tar.gz"
