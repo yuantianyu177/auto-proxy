@@ -74,6 +74,7 @@ if [[ ! "${binary_description}" =~ ${expected_description} ]]; then
 fi
 
 mkdir -p "${staging_root}/${archive_base}"
+chmod 0755 "${staging_root}/${archive_base}"
 install -m 0755 "${binary}" "${staging_root}/${archive_base}/ap"
 for document in README.md RELEASING.md LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md config.example.toml; do
   install -m 0644 "${document}" "${staging_root}/${archive_base}/${document}"

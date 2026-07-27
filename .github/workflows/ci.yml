@@ -3,12 +3,27 @@ name: CI
 on:
   push:
     branches:
-      - "**"
+      - main
   pull_request:
   workflow_dispatch:
     inputs:
+      run_throughput:
+        description: Record gateway throughput against raw OpenSSH
+        required: false
+        default: false
+        type: boolean
       enforce_throughput:
         description: Fail if gateway throughput is below 85% of raw OpenSSH
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      run_throughput:
+        required: false
+        default: false
+        type: boolean
+      enforce_throughput:
         required: false
         default: false
         type: boolean
@@ -17,54 +32,103 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  formatting:
-    name: rustfmt
-    runs-on: ubuntu-latest
+  static-analysis:
+    name: Formatting and workflow scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust components
-        run: rustup component add rustfmt
-      - name: Check formatting
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check Rust formatting
         run: cargo fmt --all --check
+      - name: Check shell syntax
+        run: |
+          for script in scripts/*.sh scripts/ci/*.sh; do
+            bash -n "${script}"
+          done
+      - name: Run ShellCheck
+        run: shellcheck scripts/*.sh scripts/ci/*.sh
+      - name: Validate GitHub Actions workflows
+        env:
+          GOTOOLCHAIN: local
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 
   quality:
-    name: test and Clippy (${{ matrix.os }})
+    name: Test and Clippy (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
-          - macos-14
+          - ubuntu-24.04
+          - macos-15
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust components
-        run: rustup component add clippy
-      - uses: actions/cache@v4
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache Cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ci-${{ runner.os }}-
-      - name: Clippy
+          key: ci-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ci-${{ runner.os }}-${{ runner.arch }}-
+      - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test
+      - name: Run tests
         run: cargo test --locked --all-targets --all-features
 
-  isolated-sshd:
-    name: isolated sshd integration
-    runs-on: ubuntu-latest
+  msrv:
+    name: Minimum supported Rust 1.88 (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-24.04
+          - macos-15
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust 1.88
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Cache Cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: msrv-${{ runner.os }}-${{ runner.arch }}-1.88.0-${{ hashFiles('Cargo.lock') }}
+          restore-keys: msrv-${{ runner.os }}-${{ runner.arch }}-1.88.0-
+      - name: Check all targets and features
+        run: cargo +1.88.0 check --locked --all-targets --all-features
+
+  isolated-sshd:
+    name: Isolated sshd integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
       AP_CI_TEST_USER: ap_ci_tunnel
       AP_CI_NETNS: ap-ci-isolated
@@ -77,11 +141,11 @@ jobs:
       AP_CI_LISTEN_DENIED_SSH_PORT: "22224"
       AP_CI_PASSWORD_SSH_PORT: "22225"
       AP_RUN_DIRECT_SSH_DEV_TEST: "1"
-      AP_DIRECT_SSH_DEV_HOST: "192.0.2.2"
+      AP_DIRECT_SSH_DEV_HOST: 192.0.2.2
       AP_DIRECT_SSH_DEV_PORT: "22222"
       AP_DIRECT_SSH_DEV_USER: ap_ci_tunnel
       AP_RUN_SSH_POLICY_TEST: "1"
-      AP_SSH_POLICY_HOST: "192.0.2.2"
+      AP_SSH_POLICY_HOST: 192.0.2.2
       AP_SSH_POLICY_USER: ap_ci_tunnel
       AP_SSH_POLICY_PROBE_SSH_PORT: "22222"
       AP_SSH_POLICY_FORWARDING_DENIED_SSH_PORT: "22223"
@@ -90,254 +154,48 @@ jobs:
       AP_SSH_POLICY_LISTEN_DENIED_PORT: "47102"
       AP_SSH_POLICY_CONFLICT_PORT: "47103"
       AP_CI_UNUSED_PERMITTED_PORT: "47104"
-      AP_RUN_THROUGHPUT_TEST: "1"
-      AP_THROUGHPUT_SSH_HOST: "192.0.2.2"
+      AP_RUN_THROUGHPUT_TEST: ${{ (inputs.run_throughput || inputs.enforce_throughput) && '1' || '0' }}
+      AP_THROUGHPUT_SSH_HOST: 192.0.2.2
       AP_THROUGHPUT_SSH_PORT: "22222"
       AP_THROUGHPUT_SSH_USER: ap_ci_tunnel
       AP_ENFORCE_THROUGHPUT: ${{ inputs.enforce_throughput && '1' || '0' }}
       AP_RUN_OPENSSH_PASSWORD_TEST: "1"
-      AP_TEST_SSH_PASSWORD_HOST: "192.0.2.2"
+      AP_TEST_SSH_PASSWORD_HOST: 192.0.2.2
       AP_TEST_SSH_PASSWORD_PORT: "22225"
       AP_TEST_SSH_PASSWORD_USER: ap_ci_tunnel
     steps:
-      - uses: actions/checkout@v4
-      - name: Install isolated sshd prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            openssh-server iproute2 iptables openssl
-      - name: Initialize ephemeral test paths
-        run: |
-          set -euo pipefail
-          test_dir="$(mktemp -d "${RUNNER_TEMP}/ap-sshd.XXXXXX")"
-          chmod 700 "$test_dir"
-          echo "AP_CI_DIR=$test_dir" >> "$GITHUB_ENV"
-      - name: Create ordinary SSH login user and ephemeral keys
-        run: |
-          set -euo pipefail
-          if id -u "$AP_CI_TEST_USER" >/dev/null 2>&1; then
-            echo "Refusing to reuse an existing login user" >&2
-            exit 1
-          fi
-
-          sudo useradd --create-home --user-group --shell /bin/sh "$AP_CI_TEST_USER"
-          touch "$AP_CI_DIR/user-created"
-          test "$(id -u "$AP_CI_TEST_USER")" -ne 0
-          if sudo -n -l -U "$AP_CI_TEST_USER" >/dev/null 2>&1; then
-            echo "The isolated SSH login user unexpectedly has sudo privileges" >&2
-            exit 1
-          fi
-
-          # One random account credential is shared only with the password-only
-          # fixture. The other sshd fixtures disable password login. Only the
-          # path to its private file is exported; the value never enters argv,
-          # env, or logs.
-          account_password="$(openssl rand -hex 32)"
-          password_fixture="$AP_CI_DIR/account-password"
-          (umask 077; printf '%s' "$account_password" > "$password_fixture")
-          chmod 600 "$password_fixture"
-          echo "AP_TEST_SSH_PASSWORD_FIXTURE_PATH=$password_fixture" >> "$GITHUB_ENV"
-          account_password_hash="$(printf '%s' "$account_password" | openssl passwd -6 -stdin)"
-          unset account_password
-          unset password_fixture
-          printf '%s:%s\n' "$AP_CI_TEST_USER" "$account_password_hash" \
-            | sudo chpasswd --encrypted
-          unset account_password_hash
-
-          ssh-keygen -q -t ed25519 -N "" -f "$AP_CI_DIR/client-key"
-          ssh-keygen -q -t ed25519 -N "" -f "$AP_CI_DIR/host-key"
-          cut -d ' ' -f 1,2 "$AP_CI_DIR/client-key.pub" \
-            | sed 's/^/restrict,port-forwarding /' > "$AP_CI_DIR/authorized_keys"
-          sudo install -d -m 700 -o "$AP_CI_TEST_USER" -g "$AP_CI_TEST_USER" \
-            "/home/$AP_CI_TEST_USER/.ssh"
-          sudo install -m 600 -o "$AP_CI_TEST_USER" -g "$AP_CI_TEST_USER" \
-            "$AP_CI_DIR/authorized_keys" "/home/$AP_CI_TEST_USER/.ssh/authorized_keys"
-
-          host_public_key="$(cut -d ' ' -f 1,2 "$AP_CI_DIR/host-key.pub")"
-          {
-            for port in \
-              "$AP_CI_SSH_PORT" \
-              "$AP_CI_FORWARDING_DENIED_SSH_PORT" \
-              "$AP_CI_LISTEN_DENIED_SSH_PORT" \
-              "$AP_CI_PASSWORD_SSH_PORT"
-            do
-              printf '[%s]:%s %s\n' "$AP_CI_SSH_ADDR" "$port" "$host_public_key"
-            done
-          } > "$AP_CI_DIR/known_hosts"
-          chmod 600 "$AP_CI_DIR/known_hosts"
-          echo "AP_DIRECT_SSH_DEV_IDENTITY_FILE=$AP_CI_DIR/client-key" >> "$GITHUB_ENV"
-          echo "AP_DIRECT_SSH_DEV_KNOWN_HOSTS=$AP_CI_DIR/known_hosts" >> "$GITHUB_ENV"
-          echo "AP_SSH_POLICY_IDENTITY_FILE=$AP_CI_DIR/client-key" >> "$GITHUB_ENV"
-          echo "AP_SSH_POLICY_KNOWN_HOSTS=$AP_CI_DIR/known_hosts" >> "$GITHUB_ENV"
-          echo "AP_THROUGHPUT_SSH_IDENTITY_FILE=$AP_CI_DIR/client-key" >> "$GITHUB_ENV"
-          echo "AP_THROUGHPUT_SSH_KNOWN_HOSTS=$AP_CI_DIR/known_hosts" >> "$GITHUB_ENV"
-          echo "AP_TEST_SSH_PASSWORD_KNOWN_HOSTS=$AP_CI_DIR/known_hosts" >> "$GITHUB_ENV"
-      - name: Start network-isolated sshd
-        run: |
-          set -euo pipefail
-          test "$AP_CI_UNUSED_PERMITTED_PORT" != "$AP_SSH_POLICY_LISTEN_DENIED_PORT"
-          sudo ip netns add "$AP_CI_NETNS"
-          touch "$AP_CI_DIR/netns-created"
-          sudo ip link add "$AP_CI_HOST_VETH" type veth peer name "$AP_CI_NS_VETH"
-          sudo ip link set "$AP_CI_NS_VETH" netns "$AP_CI_NETNS"
-          sudo ip address add "$AP_CI_HOST_ADDR/30" dev "$AP_CI_HOST_VETH"
-          sudo ip link set "$AP_CI_HOST_VETH" up
-          sudo ip netns exec "$AP_CI_NETNS" ip link set lo up
-          sudo ip netns exec "$AP_CI_NETNS" ip address add \
-            "$AP_CI_SSH_ADDR/30" dev "$AP_CI_NS_VETH"
-          sudo ip netns exec "$AP_CI_NETNS" ip link set "$AP_CI_NS_VETH" up
-
-          # The namespace has no default route. Its firewall additionally
-          # rejects all new non-loopback egress, including DNS and Internet.
-          sudo ip netns exec "$AP_CI_NETNS" iptables -P INPUT DROP
-          sudo ip netns exec "$AP_CI_NETNS" iptables -P FORWARD DROP
-          sudo ip netns exec "$AP_CI_NETNS" iptables -P OUTPUT DROP
-          sudo ip netns exec "$AP_CI_NETNS" iptables -A INPUT -i lo -j ACCEPT
-          sudo ip netns exec "$AP_CI_NETNS" iptables -A OUTPUT -o lo -j ACCEPT
-          sudo ip netns exec "$AP_CI_NETNS" iptables -A INPUT \
-            -i "$AP_CI_NS_VETH" -s "$AP_CI_HOST_ADDR" -p tcp \
-            --dport "$AP_CI_SSH_PORT:$AP_CI_PASSWORD_SSH_PORT" \
-            -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
-          sudo ip netns exec "$AP_CI_NETNS" iptables -A OUTPUT \
-            -o "$AP_CI_NS_VETH" -d "$AP_CI_HOST_ADDR" -p tcp \
-            --sport "$AP_CI_SSH_PORT:$AP_CI_PASSWORD_SSH_PORT" \
-            -m conntrack --ctstate ESTABLISHED -j ACCEPT
-          if sudo ip netns exec "$AP_CI_NETNS" ip route show default | grep -q .; then
-            echo "The isolated sshd namespace unexpectedly has a default route" >&2
-            exit 1
-          fi
-
-          sudo install -d -m 755 /run/sshd
-          write_sshd_config() {
-            config=$1
-            port=$2
-            pid_file=$3
-            forwarding=$4
-            permit_listen=$5
-            authentication_methods=$6
-            public_key_authentication=$7
-            password_authentication=$8
-            {
-            printf 'Port %s\n' "$port"
-            printf 'ListenAddress %s\n' "$AP_CI_SSH_ADDR"
-            printf 'HostKey %s\n' "$AP_CI_DIR/host-key"
-            printf 'PidFile %s\n' "$pid_file"
-            printf 'AllowUsers %s\n' "$AP_CI_TEST_USER"
-            printf 'AuthenticationMethods %s\n' "$authentication_methods"
-            printf 'PubkeyAuthentication %s\n' "$public_key_authentication"
-            printf 'PasswordAuthentication %s\n' "$password_authentication"
-            printf 'KbdInteractiveAuthentication no\n'
-            printf 'PermitEmptyPasswords no\n'
-            printf 'PermitRootLogin no\n'
-            printf 'UsePAM no\n'
-            printf 'UseDNS no\n'
-            printf 'StrictModes yes\n'
-            printf 'AllowTcpForwarding %s\n' "$forwarding"
-            printf 'GatewayPorts no\n'
-            printf 'PermitListen %s\n' "$permit_listen"
-            printf 'PermitOpen 127.0.0.1:*\n'
-            printf 'AllowAgentForwarding no\n'
-            printf 'X11Forwarding no\n'
-            printf 'PermitTTY no\n'
-            printf 'PermitTunnel no\n'
-            printf 'PermitUserEnvironment no\n'
-            printf 'PermitUserRC no\n'
-            printf 'MaxAuthTries 1\n'
-            printf 'MaxSessions 0\n'
-            printf 'LogLevel VERBOSE\n'
-            } > "$config"
-            chmod 600 "$config"
-            sudo /usr/sbin/sshd -t -f "$config"
-          }
-          sudo chown root:root "$AP_CI_DIR/host-key"
-          sudo chmod 600 "$AP_CI_DIR/host-key"
-          write_sshd_config \
-            "$AP_CI_DIR/sshd-probe.conf" \
-            "$AP_CI_SSH_PORT" \
-            "$AP_CI_DIR/sshd-probe.pid" \
-            yes '127.0.0.1:*' publickey yes no
-          write_sshd_config \
-            "$AP_CI_DIR/sshd-no-forwarding.conf" \
-            "$AP_CI_FORWARDING_DENIED_SSH_PORT" \
-            "$AP_CI_DIR/sshd-no-forwarding.pid" \
-            no '127.0.0.1:*' publickey yes no
-          write_sshd_config \
-            "$AP_CI_DIR/sshd-listen-denied.conf" \
-            "$AP_CI_LISTEN_DENIED_SSH_PORT" \
-            "$AP_CI_DIR/sshd-listen-denied.pid" \
-            yes "127.0.0.1:$AP_CI_UNUSED_PERMITTED_PORT" publickey yes no
-          write_sshd_config \
-            "$AP_CI_DIR/sshd-password-only.conf" \
-            "$AP_CI_PASSWORD_SSH_PORT" \
-            "$AP_CI_DIR/sshd-password-only.pid" \
-            yes '127.0.0.1:*' password no yes
-          sudo /usr/sbin/sshd -T -f "$AP_CI_DIR/sshd-password-only.conf" \
-            | grep -Fqx 'authenticationmethods password'
-          sudo /usr/sbin/sshd -T -f "$AP_CI_DIR/sshd-password-only.conf" \
-            | grep -Fqx 'pubkeyauthentication no'
-          sudo /usr/sbin/sshd -T -f "$AP_CI_DIR/sshd-password-only.conf" \
-            | grep -Fqx 'passwordauthentication yes'
-
-          start_sshd() {
-            name=$1
-            config=$2
-            sudo ip netns exec "$AP_CI_NETNS" \
-              /usr/sbin/sshd -D -e -f "$config" \
-              </dev/null >"$AP_CI_DIR/sshd-$name.log" 2>&1 &
-            echo "$!" > "$AP_CI_DIR/sshd-$name.process"
-          }
-          start_sshd probe "$AP_CI_DIR/sshd-probe.conf"
-          start_sshd no-forwarding "$AP_CI_DIR/sshd-no-forwarding.conf"
-          start_sshd listen-denied "$AP_CI_DIR/sshd-listen-denied.conf"
-          start_sshd password-only "$AP_CI_DIR/sshd-password-only.conf"
-          sleep 1
-          for process_file in "$AP_CI_DIR"/sshd-*.process; do
-            sshd_process="$(cat "$process_file")"
-            if ! sudo kill -0 "$sshd_process" 2>/dev/null; then
-              for log in "$AP_CI_DIR"/sshd-*.log; do
-                sed -n '1,120p' "$log" >&2
-              done
-              exit 1
-            fi
-          done
-      - uses: actions/cache@v4
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache Cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: isolated-sshd-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: isolated-sshd-${{ runner.os }}-
-      - name: Run reverse-forward integration test
-        run: cargo test --locked --test direct_ssh_dev -- --ignored --nocapture
-      - name: Run sshd policy and cleanup integration test
-        run: cargo test --locked --test sshd_policy_ci -- --ignored --nocapture
-      - name: Run real password-only OpenSSH AskPass integration test
-        run: cargo test --locked --test openssh_password_linux -- --nocapture
-      - name: Record reverse-tunnel gateway throughput
-        run: cargo test --locked --release --test throughput_ci -- --ignored --nocapture
-      - name: Show isolated sshd diagnostics on failure
-        if: failure()
+          key: isolated-sshd-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: isolated-sshd-${{ runner.os }}-${{ runner.arch }}-
+      - name: Install isolated sshd prerequisites
         run: |
-          for log in "$AP_CI_DIR"/sshd-*.log; do
-            if test -f "$log"; then
-              sed -n '1,160p' "$log"
-            fi
-          done
-      - name: Remove ephemeral sshd, user, keys, and namespace
-        if: always()
-        run: |
-          set +e
-          if test -n "${AP_CI_DIR:-}" && test -f "$AP_CI_DIR/netns-created"; then
-            for process in $(sudo ip netns pids "$AP_CI_NETNS" 2>/dev/null); do
-              sudo kill "$process" 2>/dev/null || true
-            done
-            sudo ip netns delete "$AP_CI_NETNS" 2>/dev/null || true
-            sudo ip link delete "$AP_CI_HOST_VETH" 2>/dev/null || true
-          fi
-          if test -n "${AP_CI_DIR:-}" && test -f "$AP_CI_DIR/user-created"; then
-            sudo userdel --remove "$AP_CI_TEST_USER" 2>/dev/null || true
-          fi
-          case "${AP_CI_DIR:-}" in
-            "$RUNNER_TEMP"/ap-sshd.*) rm -rf -- "$AP_CI_DIR" ;;
-          esac
+          sudo apt-get -o Acquire::Retries=3 update
+          sudo apt-get -o Acquire::Retries=3 install --yes --no-install-recommends \
+            openssh-server iproute2 iptables openssl
+      - name: Set up isolated sshd fixture
+        run: bash scripts/ci/setup-isolated-sshd.sh
+      - name: Test reverse-forward protocols and reconnection
+        run: timeout --signal=TERM --kill-after=30s 8m cargo test --locked --test direct_ssh_dev -- --ignored --nocapture
+      - name: Test sshd policy failures and cleanup
+        run: timeout --signal=TERM --kill-after=30s 5m cargo test --locked --test sshd_policy_ci -- --ignored --nocapture
+      - name: Test password-only OpenSSH AskPass
+        run: timeout --signal=TERM --kill-after=30s 5m cargo test --locked --test openssh_password_linux -- --nocapture
+      - name: Measure reverse-tunnel gateway throughput
+        if: env.AP_RUN_THROUGHPUT_TEST == '1'
+        run: timeout --signal=TERM --kill-after=30s 10m cargo test --locked --release --test throughput_ci -- --ignored --nocapture
+      - name: Show isolated sshd diagnostics
+        if: failure() && env.AP_CI_DIR != ''
+        run: bash scripts/ci/show-isolated-sshd-diagnostics.sh
+      - name: Remove isolated sshd fixture
+        if: always() && env.AP_CI_DIR != ''
+        run: bash scripts/ci/cleanup-isolated-sshd.sh

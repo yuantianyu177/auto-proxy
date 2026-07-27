@@ -20,6 +20,20 @@ command -v jq >/dev/null || {
   echo "jq is required to verify the release bundle" >&2
   exit 1
 }
+command -v file >/dev/null || {
+  echo "file is required to verify release binary formats" >&2
+  exit 1
+}
+temporary_root="$(mktemp -d)"
+cleanup() {
+  if [[ -n "${temporary_root}" && -d "${temporary_root}" && ! -L "${temporary_root}" ]]; then
+    rm -rf -- "${temporary_root}"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 sbom="${bundle_directory}/ap-v${version}-sbom.cdx.json"
 checksum_file="${bundle_directory}/SHA256SUMS"
 
@@ -103,6 +117,45 @@ do
   )"
   if [[ "${actual_members}" != "${expected_members}" ]]; then
     echo "archive ${archive_base}.tar.gz does not contain the exact release file set" >&2
+    exit 1
+  fi
+
+  actual_metadata="$(
+    LC_ALL=C tar -tvzf "${archive}" \
+      | awk '{ print substr($1, 1, 10), $NF }' \
+      | LC_ALL=C sort
+  )"
+  expected_metadata="$({
+    printf '%s\n' "drwxr-xr-x ${archive_base}/"
+    printf '%s\n' "-rwxr-xr-x ${archive_base}/ap"
+    for document in README.md RELEASING.md LICENSE LICENSE-MIT LICENSE-APACHE CHANGELOG.md config.example.toml; do
+      printf '%s\n' "-rw-r--r-- ${archive_base}/${document}"
+    done
+  } | LC_ALL=C sort)"
+  if [[ "${actual_metadata}" != "${expected_metadata}" ]]; then
+    echo "archive ${archive_base}.tar.gz contains an unexpected file type or mode" >&2
+    exit 1
+  fi
+
+  binary_temporary="${temporary_root}/${target}-ap"
+  tar -xOzf "${archive}" "${archive_base}/ap" > "${binary_temporary}"
+  binary_description="$(file -b "${binary_temporary}")"
+  case "${target}" in
+    x86_64-unknown-linux-musl)
+      expected_description='ELF.*x86-64.*(statically linked|static-pie linked)'
+      ;;
+    aarch64-unknown-linux-musl)
+      expected_description='ELF.*(aarch64|ARM64).*(statically linked|static-pie linked)'
+      ;;
+    x86_64-apple-darwin)
+      expected_description='Mach-O.*x86_64'
+      ;;
+    aarch64-apple-darwin)
+      expected_description='Mach-O.*arm64'
+      ;;
+  esac
+  if [[ ! "${binary_description}" =~ ${expected_description} ]]; then
+    echo "archive binary does not match ${target}: ${binary_description}" >&2
     exit 1
   fi
 done

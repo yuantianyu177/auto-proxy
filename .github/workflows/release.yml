@@ -7,14 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Cargo package version; blank uses Cargo.toml (manual runs never publish)"
+        description: Cargo package version; blank uses Cargo.toml (manual runs never publish)
         required: false
         type: string
-      require_macos_signing:
-        description: "Fail a manual dry-run unless Developer ID signing secrets are configured"
-        required: true
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -23,42 +18,60 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+defaults:
+  run:
+    shell: bash
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   prepare:
     name: Validate release request
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.release.outputs.version }}
+      commit_sha: ${{ steps.release.outputs.commit_sha }}
       publish: ${{ steps.release.outputs.publish }}
-      require_signing: ${{ steps.release.outputs.require_signing }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
       bundle_name: ${{ steps.release.outputs.bundle_name }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out complete source history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - id: release
         name: Validate version and release policy
         env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           REQUESTED_VERSION: ${{ inputs.version }}
-          REQUEST_SIGNING: ${{ inputs.require_macos_signing }}
         run: |
           set -euo pipefail
-          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          cargo_version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "auto-proxy") | .version')"
+          if [[ -z "${cargo_version}" ]]; then
+            echo "could not determine the auto-proxy package version" >&2
+            exit 1
+          fi
+          source_commit="$(git rev-parse 'HEAD^{commit}')"
 
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             if [[ "${GITHUB_REF_TYPE}" != "tag" || ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
               echo "release tag must be v<semver>, got ${GITHUB_REF_NAME}" >&2
               exit 1
             fi
+            if ! git merge-base --is-ancestor "${source_commit}" "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+              echo "release tags must point to a commit reachable from ${DEFAULT_BRANCH}" >&2
+              exit 1
+            fi
             version="${GITHUB_REF_NAME#v}"
             publish=true
-            require_signing=true
             bundle_name="ap-v${version}-release-bundle"
           else
-            version="${REQUESTED_VERSION:-$cargo_version}"
+            version="${REQUESTED_VERSION:-${cargo_version}}"
             publish=false
-            require_signing="${REQUEST_SIGNING:-false}"
             bundle_name="ap-v${version}-dry-run-bundle"
           fi
 
@@ -71,26 +84,30 @@ jobs:
             exit 1
           fi
 
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "publish=${publish}" >> "${GITHUB_OUTPUT}"
-          echo "require_signing=${require_signing}" >> "${GITHUB_OUTPUT}"
-          echo "bundle_name=${bundle_name}" >> "${GITHUB_OUTPUT}"
+          version_without_build="${version%%+*}"
+          if [[ "${version_without_build}" == *-* ]]; then
+            prerelease=true
+          else
+            prerelease=false
+          fi
+
+          {
+            printf 'version=%s\n' "${version}"
+            printf 'commit_sha=%s\n' "${source_commit}"
+            printf 'publish=%s\n' "${publish}"
+            printf 'prerelease=%s\n' "${prerelease}"
+            printf 'bundle_name=%s\n' "${bundle_name}"
+          } >> "${GITHUB_OUTPUT}"
 
   quality:
-    name: Test, Clippy, and rustfmt release source
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust components
-        run: rustup component add clippy rustfmt
-      - name: Check formatting
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --locked --all-targets --all-features
+    name: Validate release source
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      run_throughput: false
+      enforce_throughput: false
 
-  build:
+  build-linux:
     name: Build ${{ matrix.target }}
     needs:
       - prepare
@@ -98,73 +115,29 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            builder: cross
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            builder: cross
-          - target: x86_64-apple-darwin
-            os: macos-14
-            builder: cargo
-          - target: aarch64-apple-darwin
-            os: macos-14
-            builder: cargo
-    runs-on: ${{ matrix.os }}
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - name: Install Rust target
-        run: rustup target add "${{ matrix.target }}"
-      - uses: actions/cache@v4
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache Cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
             ~/.cargo/registry/cache
             ~/.cargo/git/db
-          key: release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: release-${{ runner.os }}-${{ matrix.target }}-
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
       - name: Install cross
-        if: matrix.builder == 'cross'
         run: cargo install cross --locked --version 0.2.5
-      - name: Build Linux release binary
-        if: matrix.builder == 'cross'
+      - name: Build release binary
         run: cross build --locked --release --target "${{ matrix.target }}"
-      - name: Build macOS release binary
-        if: matrix.builder == 'cargo'
-        run: cargo build --locked --release --target "${{ matrix.target }}"
-      - name: Sign or gate macOS binary
-        if: runner.os == 'macOS'
-        env:
-          AP_MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.AP_MACOS_CERTIFICATE_P12_BASE64 }}
-          AP_MACOS_CERTIFICATE_PASSWORD: ${{ secrets.AP_MACOS_CERTIFICATE_PASSWORD }}
-          AP_MACOS_SIGNING_IDENTITY: ${{ secrets.AP_MACOS_SIGNING_IDENTITY }}
-          REQUIRE_SIGNING: ${{ needs.prepare.outputs.require_signing }}
-        run: |
-          set -euo pipefail
-          binary="target/${{ matrix.target }}/release/ap"
-          configured_secrets=0
-          if [[ -n "${AP_MACOS_CERTIFICATE_P12_BASE64}" ]]; then
-            configured_secrets=$((configured_secrets + 1))
-          fi
-          if [[ -n "${AP_MACOS_CERTIFICATE_PASSWORD}" ]]; then
-            configured_secrets=$((configured_secrets + 1))
-          fi
-          if [[ -n "${AP_MACOS_SIGNING_IDENTITY}" ]]; then
-            configured_secrets=$((configured_secrets + 1))
-          fi
-
-          if [[ "${configured_secrets}" -eq 3 ]]; then
-            bash scripts/sign-macos.sh "${binary}"
-          elif [[ "${configured_secrets}" -ne 0 ]]; then
-            echo "macOS signing is partially configured; all three AP_MACOS_* secrets are required" >&2
-            exit 1
-          elif [[ "${REQUIRE_SIGNING}" == "true" ]]; then
-            echo "stable/tagged releases require all three AP_MACOS_* signing secrets" >&2
-            exit 1
-          else
-            echo "manual dry-run: macOS artifact is intentionally unsigned"
-          fi
       - name: Package target
         run: |
           bash scripts/package-release.sh \
@@ -172,22 +145,180 @@ jobs:
             "${{ needs.prepare.outputs.version }}" \
             "target/${{ matrix.target }}/release/ap" \
             dist
-      - uses: actions/upload-artifact@v4
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package-${{ matrix.target }}
           path: dist/*.tar.gz
           if-no-files-found: error
-          retention-days: 14
+          compression-level: 0
+          retention-days: 1
 
-  bundle:
-    name: Generate SBOM and checksums
+  build-macos:
+    name: Build unsigned ${{ matrix.target }}
     needs:
       - prepare
-      - build
-    runs-on: ubuntu-latest
+      - quality
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    runs-on: macos-15
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.target }}"
+      - name: Cache Cargo downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: release-${{ runner.os }}-${{ runner.arch }}-${{ matrix.target }}-
+      - name: Build release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+      - name: Upload unsigned binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/ap
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  sign-macos:
+    name: Sign ${{ matrix.target }}
+    if: needs.prepare.outputs.publish == 'true'
+    needs:
+      - prepare
+      - quality
+      - build-macos
+    environment:
+      name: release
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download unsigned binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: unsigned
+      - name: Restore executable mode
+        run: |
+          test -f unsigned/ap
+          test ! -L unsigned/ap
+          chmod 0755 unsigned/ap
+      - name: Sign release binary
+        env:
+          AP_MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.AP_MACOS_CERTIFICATE_P12_BASE64 }}
+          AP_MACOS_CERTIFICATE_PASSWORD: ${{ secrets.AP_MACOS_CERTIFICATE_PASSWORD }}
+          AP_MACOS_SIGNING_IDENTITY: ${{ secrets.AP_MACOS_SIGNING_IDENTITY }}
+        run: bash scripts/sign-macos.sh unsigned/ap
+      - name: Upload signed binary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-${{ matrix.target }}
+          path: unsigned/ap
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  package-macos:
+    name: Package ${{ matrix.target }}
+    if: >-
+      ${{
+        always()
+        && needs.prepare.result == 'success'
+        && needs.quality.result == 'success'
+        && needs.build-macos.result == 'success'
+        && (
+          needs.prepare.outputs.publish != 'true'
+          || needs.sign-macos.result == 'success'
+        )
+      }}
+    needs:
+      - prepare
+      - quality
+      - build-macos
+      - sign-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download macOS binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.prepare.outputs.publish == 'true' && format('signed-{0}', matrix.target) || format('unsigned-{0}', matrix.target) }}
+          path: packaged
+      - name: Restore executable mode
+        run: |
+          test -f packaged/ap
+          test ! -L packaged/ap
+          chmod 0755 packaged/ap
+      - name: Verify tagged release signature
+        if: needs.prepare.outputs.publish == 'true'
+        run: codesign --verify --strict --verbose=2 packaged/ap
+      - name: Mark manual build as unsigned
+        if: needs.prepare.outputs.publish != 'true'
+        run: echo "manual dry-run macOS package is intentionally unsigned"
+      - name: Package target
+        run: |
+          bash scripts/package-release.sh \
+            "${{ matrix.target }}" \
+            "${{ needs.prepare.outputs.version }}" \
+            packaged/ap \
+            dist
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  bundle:
+    name: Generate and verify release bundle
+    needs:
+      - prepare
+      - build-linux
+      - package-macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download target packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: package-*
           path: dist
@@ -198,15 +329,17 @@ jobs:
           bash scripts/generate-sbom.sh \
             "${{ needs.prepare.outputs.version }}" \
             "dist/ap-v${{ needs.prepare.outputs.version }}-sbom.cdx.json"
-      - name: Generate and verify SHA256SUMS
+      - name: Generate checksums and verify bundle
         run: |
           bash scripts/sha256sums.sh "${{ needs.prepare.outputs.version }}" dist
           bash scripts/verify-release-bundle.sh "${{ needs.prepare.outputs.version }}" dist
-      - uses: actions/upload-artifact@v4
+      - name: Upload release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ needs.prepare.outputs.bundle_name }}
           path: dist/*
           if-no-files-found: error
+          compression-level: 0
           retention-days: 30
 
   publish:
@@ -215,21 +348,31 @@ jobs:
     needs:
       - prepare
       - bundle
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: release
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.prepare.outputs.bundle_name }}
           path: dist
-      - name: Create release and upload assets
+      - name: Verify downloaded release bundle
+        run: bash scripts/verify-release-bundle.sh "${{ needs.prepare.outputs.version }}" dist
+      - name: Publish verified draft atomically
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          set -euo pipefail
-          gh release create "${RELEASE_TAG}" dist/* \
-            --verify-tag \
-            --generate-notes \
-            --title "ap ${RELEASE_TAG}"
+          bash scripts/ci/publish-release.sh \
+            "${{ github.ref_name }}" \
+            "${{ needs.prepare.outputs.commit_sha }}" \
+            dist \
+            "${{ needs.prepare.outputs.prerelease }}"

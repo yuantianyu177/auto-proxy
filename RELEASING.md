@@ -9,7 +9,7 @@
 
 每个 `tar.gz` 必须精确包含八个成员：`ap`、`README.md`、`RELEASING.md`、`CHANGELOG.md`、`config.example.toml`、`LICENSE`、`LICENSE-MIT` 和 `LICENSE-APACHE`。
 
-完整 release bundle 必须精确校验以下九个带哈希的资产：四个目标压缩包、`README.md`、`LICENSE`、`CHANGELOG.md`、`config.example.toml` 和 CycloneDX JSON SBOM。`SHA256SUMS` 本身作为第十个资产发布，但不递归包含自身哈希。`verify-release-bundle.sh` 同时验证哈希条目、SBOM 元数据以及每个压缩包的精确成员集合。
+完整 release bundle 必须精确校验以下九个带哈希的资产：四个目标压缩包、`README.md`、`LICENSE`、`CHANGELOG.md`、`config.example.toml` 和 CycloneDX JSON SBOM。`SHA256SUMS` 本身作为第十个资产发布，但不递归包含自身哈希。`verify-release-bundle.sh` 同时验证哈希条目、SBOM 元数据、每个压缩包的精确成员集合、文件类型与权限，以及二进制架构；Linux 产物还必须是静态链接。
 
 ## v2 发布边界
 
@@ -30,22 +30,17 @@
 
 ## macOS Developer ID 门禁
 
-仓库需要配置以下 GitHub Actions secrets：
+仓库需要在名为 `release` 的 GitHub Actions Environment 中配置以下 secrets：
 
 - `AP_MACOS_CERTIFICATE_P12_BASE64`：Developer ID Application 证书及私钥的 PKCS#12 文件，经 Base64 编码后的完整内容。
 - `AP_MACOS_CERTIFICATE_PASSWORD`：PKCS#12 导出密码。
 - `AP_MACOS_SIGNING_IDENTITY`：`Developer ID Application: ...` 身份名称，或对应证书 SHA-1 标识。
 
-标签发布强制要求三项 secret 全部存在。两个 macOS Mach-O 文件均使用 hardened runtime、可信时间戳和 code-signing identifier `dev.approxy.ap` 签名；secret 缺失、只配置一部分、身份不匹配或 `codesign --verify` 失败都会阻止发布。签名用于确认正式 macOS 产物的来源和完整性，identifier 不应随版本变化。
+标签发布强制要求三项 secret 全部存在。两个 macOS Mach-O 文件均使用 hardened runtime、可信时间戳和 code-signing identifier `dev.approxy.ap` 签名；secret 缺失、身份不匹配或 `codesign --verify` 失败都会阻止发布。签名在引用 `release` Environment 且不运行 Cargo 构建脚本的全新 runner job 中完成，降低构建进程接触签名 secret 的风险。签名用于确认正式 macOS 产物的来源和完整性，identifier 不应随版本变化。
 
-CI、pull request 和普通分支构建不会接收签名 secret。手动运行 Release workflow 只产生检查用 artifact，绝不创建 GitHub Release：
+CI、pull request 和普通分支构建不会接收签名 secret。手动运行 Release workflow 只产生明确标记的未签名 dry-run artifact，不会进入 `release` Environment，也绝不创建 GitHub Release。只有指向默认分支可达提交且版本与 `Cargo.toml` 完全一致的 `v<semver>` 标签才能进入签名和发布步骤。
 
-- 三项 secret 全部存在时，手动产物会签名。
-- 三项均不存在且 `require_macos_signing=false` 时，生成明确标记的未签名 dry-run artifact。
-- 只配置部分 secret 始终失败。
-- `require_macos_signing=true` 时，完全未配置也会失败。
-
-建议将签名值保存为权限受限的仓库或组织 Actions secrets，并对发布标签启用保护。当前流程不执行 Apple notarization；如果分发渠道要求公证，应增加独立的 `notarytool` 门禁，不能降低现有签名检查。
+必须删除同名 repository/organization secrets，只在 `release` Environment 保存签名值；否则旧提交中的 workflow 仍可能读取仓库级 secret。为该 Environment 限制仅允许受保护的 `v*` 标签部署，并建议启用 reviewer。仓库还应使用 tag ruleset 禁止未授权创建、更新或删除 `v*` 标签。workflow 会在创建 draft 前及公开前再次确认标签仍指向本次构建提交，但只有不可移动的标签规则才能消除最后的竞态窗口。当前流程不执行 Apple notarization；如果分发渠道要求公证，应增加独立的 `notarytool` 门禁，不能降低现有签名检查。
 
 安装新版本前，应先用旧版本执行 `ap -c` 关闭活动 supervisor，再替换二进制并重新显式启动所需 connection。已经运行的进程不会因磁盘文件被覆盖而自动切换版本或配置快照。
 
@@ -57,9 +52,11 @@ CI、pull request 和普通分支构建不会接收签名 secret。手动运行 
 cargo fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
+cargo +1.88.0 check --locked --all-targets --all-features
+go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
 ```
 
-同时确认 `.github/workflows/ci.yml` 和 Release workflow 的 quality job 通过。普通共享 runner 上的吞吐基准只用于观察；需要把性能比例作为门禁时，应在稳定、独占的基准环境中执行。
+同时确认 `.github/workflows/ci.yml` 通过。Release workflow 会复用完整 CI（包括 Linux、macOS、MSRV 和隔离 sshd 集成测试），而不是维护另一套较弱的重复检查。吞吐基准默认不在共享 runner 上运行；需要记录或强制性能比例时，从 CI 的手动入口启用 `run_throughput` 或 `enforce_throughput`。
 
 发布测试必须至少覆盖：
 
@@ -112,7 +109,7 @@ bash scripts/sha256sums.sh 0.1.0 dist
 bash scripts/verify-release-bundle.sh 0.1.0 dist
 ```
 
-验证脚本会拒绝 bundle 中缺失、额外、符号链接、重复或未被哈希覆盖的资产，并拒绝压缩包中缺少 `config.example.toml`、包含额外成员或目录结构错误的情况。
+验证脚本会拒绝 bundle 中缺失、额外、符号链接、重复或未被哈希覆盖的资产，并拒绝压缩包中缺少 `config.example.toml`、包含额外成员、目录结构错误、非普通文件、权限错误、架构错误或 Linux 动态链接的情况。
 
 ## 正式发布步骤
 
@@ -121,7 +118,7 @@ bash scripts/verify-release-bundle.sh 0.1.0 dist
 3. 在本机生成完整 bundle，并通过 `verify-release-bundle.sh`。
 4. 合并候选提交，确认目标提交的完整 CI 通过。
 5. 创建并推送与 Cargo 版本匹配的 `v<semver>` 标签。
-6. 确认标签工作流中的四个压缩包、macOS 签名、SBOM、校验和 bundle 验证全部通过。
-7. 检查 GitHub Release 包含 `config.example.toml` 和所有预期资产。
+6. 确认标签工作流中的完整 CI、四个压缩包、macOS 签名、SBOM、校验和 bundle 验证全部通过。
+7. 工作流先创建不可见 draft，核对远端每个资产的 SHA-256 和标签提交后才公开；检查 GitHub Release 包含 `config.example.toml` 和所有预期资产。
 
 不要从未签名的手动 dry-run artifact 创建稳定版本。
