@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -94,6 +96,42 @@ pub fn print_environment(blocks: &[EnvironmentBlock]) {
     }
 }
 
+pub fn render_table<const COLUMNS: usize>(
+    headers: [&str; COLUMNS],
+    rows: &[[String; COLUMNS]],
+) -> String {
+    let mut widths = std::array::from_fn(|column| headers[column].len());
+    for row in rows {
+        for (column, value) in row.iter().enumerate() {
+            widths[column] = widths[column].max(value.len());
+        }
+    }
+
+    let mut output = String::new();
+    write_table_row(&mut output, &headers, &widths);
+    for row in rows {
+        let values = std::array::from_fn(|column| row[column].as_str());
+        write_table_row(&mut output, &values, &widths);
+    }
+    output
+}
+
+fn write_table_row<const COLUMNS: usize>(
+    output: &mut String,
+    values: &[&str; COLUMNS],
+    widths: &[usize; COLUMNS],
+) {
+    for (column, value) in values.iter().enumerate() {
+        if column + 1 == COLUMNS {
+            output.push_str(value);
+        } else {
+            write!(output, "{value:<width$}  ", width = widths[column])
+                .expect("writing to a String cannot fail");
+        }
+    }
+    output.push('\n');
+}
+
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -142,5 +180,37 @@ mod tests {
     #[test]
     fn shell_quoting_handles_single_quotes() {
         assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn table_uses_content_widths_instead_of_terminal_tabs() {
+        let rows = [
+            [
+                "dev".to_owned(),
+                "connected".to_owned(),
+                "88931".to_owned(),
+                "1".to_owned(),
+                "-".to_owned(),
+            ],
+            [
+                "production".to_owned(),
+                "failed".to_owned(),
+                "-".to_owned(),
+                "12".to_owned(),
+                "AP_SSH_EXITED".to_owned(),
+            ],
+        ];
+
+        let rendered = render_table(["NAME", "STATUS", "SSH_PID", "PROXIES", "ERROR"], &rows);
+
+        assert_eq!(
+            rendered,
+            concat!(
+                "NAME        STATUS     SSH_PID  PROXIES  ERROR\n",
+                "dev         connected  88931    1        -\n",
+                "production  failed     -        12       AP_SSH_EXITED\n",
+            )
+        );
+        assert!(!rendered.contains('\t'));
     }
 }

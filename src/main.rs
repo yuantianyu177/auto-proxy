@@ -6,7 +6,7 @@ use auto_proxy::config::{AppPaths, ConfigStore};
 use auto_proxy::doctor::{self, CheckStatus};
 use auto_proxy::error::{ApError, Result};
 use auto_proxy::model::{ResolvedConnection, ResolvedSshAuth};
-use auto_proxy::presentation::print_environment;
+use auto_proxy::presentation::{print_environment, render_table};
 use auto_proxy::secrets::SshPassword;
 use auto_proxy::ssh;
 use auto_proxy::supervisor::{self, ConnectionPhase, StartResult};
@@ -256,20 +256,23 @@ async fn list(paths: &AppPaths) -> Result<()> {
         return Ok(());
     }
 
-    println!("NAME\tSTATUS\tSSH_PID\tPROXIES\tERROR");
-    for connection in active {
-        println!(
-            "{}\t{}\t{}\t{}\t{}",
-            connection.name,
-            phase_name(connection.phase),
-            connection
-                .ssh_pid
-                .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "-".to_owned()),
-            connection.proxies.len(),
-            connection.error_code.as_deref().unwrap_or("-"),
-        );
-    }
+    let rows = active
+        .into_iter()
+        .map(|connection| {
+            [
+                connection.name,
+                phase_name(connection.phase).to_owned(),
+                connection
+                    .ssh_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".to_owned()),
+                connection.proxies.len().to_string(),
+                connection.error_code.unwrap_or_else(|| "-".to_owned()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let table = render_table(["NAME", "STATUS", "SSH_PID", "PROXIES", "ERROR"], &rows);
+    print!("{table}");
     Ok(())
 }
 
