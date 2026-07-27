@@ -25,6 +25,8 @@ ap -v
 
 Rust 1.88 or later and the system OpenSSH client are required.
 
+Prebuilt Linux and macOS archives are available from GitHub Releases. The macOS binaries are not signed with an Apple Developer ID or notarized, so Gatekeeper may block them or require manual approval. Verify downloaded files against the published `SHA256SUMS`.
+
 ### Configure
 
 `ap` reads one manually maintained TOML configuration file:

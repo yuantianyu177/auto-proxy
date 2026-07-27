@@ -28,19 +28,17 @@ A release candidate must conform to the current v2 behavior and must not retain 
 
 `config.example.toml` is part of the stable release interface. Changes to the configuration schema, defaults, or authentication fields must update this file, the README, tests, and CHANGELOG in the same candidate commit.
 
-## macOS Developer ID gate
+## macOS ad-hoc signatures
 
-Configure these secrets in a GitHub Actions Environment named `release`:
+Both macOS archives intentionally contain binaries with only an ad-hoc signature. The stable identifier `dev.approxy.ap` and ad-hoc CDHash support ap's internal process-identity checks, but provide no Apple publisher trust. The binaries are not signed with an Apple Developer ID or notarized. The release workflow requires no Apple certificate, private key, or signing secret; the `release` Environment remains only as a protected publication gate.
 
-- `AP_MACOS_CERTIFICATE_P12_BASE64`: the complete Base64-encoded contents of the PKCS#12 file containing the Developer ID Application certificate and private key.
-- `AP_MACOS_CERTIFICATE_PASSWORD`: the PKCS#12 export password.
-- `AP_MACOS_SIGNING_IDENTITY`: the `Developer ID Application: ...` identity name or corresponding certificate SHA-1 fingerprint.
+GitHub Release notes must place this limitation before the automatically generated notes, because macOS Gatekeeper may block the binaries or require manual approval.
 
-All three secrets are mandatory for a tagged release. Both macOS Mach-O files are signed with the hardened runtime, a trusted timestamp, and the code-signing identifier `dev.approxy.ap`. Missing secrets, identity mismatches, or a failed `codesign --verify` block the release. Signing runs in a fresh runner job that references the `release` Environment and does not run Cargo build scripts, reducing the risk that build processes can access signing secrets. The signature establishes the origin and integrity of stable macOS artifacts; the identifier must remain stable across versions.
+`SHA256SUMS` verifies download integrity but does not authenticate an Apple code-signing identity. If trusted public macOS distribution becomes a requirement, add Developer ID signing and Apple notarization as explicit release gates rather than silently changing the artifact policy.
 
-CI, pull requests, and ordinary branch builds do not receive signing secrets. Manually running the Release workflow produces only an explicitly labeled, unsigned dry-run artifact. It does not enter the `release` Environment and never creates a GitHub Release. Only a `v<semver>` tag that points to a commit reachable from the default branch and exactly matches the version in `Cargo.toml` can enter the signing and publication steps.
+Manual Release workflow runs and tagged releases build the same target archives. Manual runs upload a dry-run bundle but never create a GitHub Release. Only a `v<semver>` tag that points to a commit reachable from the default branch and exactly matches the version in `Cargo.toml` can enter the publication step.
 
-Remove same-named repository and organization secrets, and store signing values only in the `release` Environment. Otherwise, workflows from older commits may still read repository-level secrets. Restrict this Environment to deployments from protected `v*` tags only, and consider requiring a reviewer. The repository should also use a tag ruleset to prevent unauthorized creation, modification, or deletion of `v*` tags. The workflow confirms again before creating the draft and before publication that the tag still points to the commit being built, but only immutable tag rules can eliminate the final race window. The current process does not perform Apple notarization. If the distribution channel requires notarization, add a separate `notarytool` gate without weakening the existing signing checks.
+The repository should use a tag ruleset to prevent unauthorized creation, modification, or deletion of `v*` tags. The workflow confirms again before creating the draft and before publication that the tag still points to the commit being built, but only immutable tag rules can eliminate the final race window.
 
 Before installing a new version, use the old version to run `ap -c` and stop active supervisors. Then replace the binary and explicitly restart the required connections. Running processes do not automatically switch versions or configuration snapshots when the on-disk binary is replaced.
 
@@ -74,7 +72,7 @@ Release testing must cover at least:
 
 Cross-compilation does not replace testing on real target systems. A stable release must preserve records of at least these checks:
 
-- On currently supported macOS versions, verify the Developer ID signatures of both architecture artifacts, and test help, XDG paths, foreground/background supervisors, and cleanup on real machines.
+- On currently supported macOS versions, verify `Signature=adhoc` and `Identifier=dev.approxy.ap` for both architecture artifacts, document the Gatekeeper behavior, and test help, XDG paths, foreground/background supervisors, password AskPass, and cleanup on real machines.
 - On supported Linux environments, verify that the musl artifacts run, and test secure path handling both with and without `XDG_RUNTIME_DIR` set.
 - Use an isolated sshd or VM where the remote has no default route, no public DNS, no ap installation, and only an unprivileged user. Test both an explicit identity file and interactive `/dev/tty` password authentication. Confirm that explicit starts and restarts prompt again, and that password-authenticated connections do not reconnect after disconnection.
 - Place an OpenSSH user configuration in the test user's home directory that would alter the target, commands, or forwards, and confirm that ap still uses only the direct SSH fields from v2 configuration.
@@ -118,7 +116,7 @@ The verification script rejects missing, extra, symbolic-link, duplicate, or unh
 3. Generate the complete bundle locally and pass `verify-release-bundle.sh`.
 4. Merge the candidate commit and confirm that its full CI run passes.
 5. Create and push a `v<semver>` tag matching the Cargo version.
-6. Confirm that the tagged workflow passes the full CI suite, creates all four archives, signs the macOS binaries, generates the SBOM and checksums, and verifies the bundle.
+6. Confirm that the tagged workflow passes the full CI suite, creates all four archives, applies only the expected ad-hoc signatures to macOS binaries, generates the SBOM and checksums, and verifies the bundle.
 7. The workflow first creates a private draft and publishes it only after verifying every remote asset's SHA-256 and the tag commit. Confirm that the GitHub Release contains `config.example.toml` and every expected asset.
 
-Never create a stable release from an unsigned manual dry-run artifact.
+Never create a stable release from a manual dry-run artifact; only the tagged workflow may publish.

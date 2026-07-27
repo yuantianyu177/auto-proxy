@@ -108,11 +108,13 @@ if gh release view "${release_tag}" >/dev/null 2>&1; then
   exit 1
 fi
 
+release_notice=$'## macOS artifacts are not Developer ID signed\n\nThe binaries in the `x86_64-apple-darwin` and `aarch64-apple-darwin` archives carry only an ad-hoc signature required by ap process-identity checks. They are not signed with an Apple Developer ID or notarized. macOS Gatekeeper may block them or require manual approval. Verify downloads against `SHA256SUMS`.'
 create_arguments=(
   "${release_tag}"
   --draft
   --verify-tag
   --generate-notes
+  --notes "${release_notice}"
   --title "ap ${release_tag}"
 )
 if [[ "${prerelease}" == true ]]; then

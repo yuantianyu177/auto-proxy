@@ -25,6 +25,7 @@ This project follows Semantic Versioning.
 - SSH passwords remain in controlled memory only during initial authentication and are cleared immediately afterward. Password-authenticated connections terminate after disconnection and do not reconnect automatically; a later explicit start or restart prompts again.
 - All terminal output, help text, errors, and runtime logs are concise and in English.
 - Configuration is entirely user-authored. The program only reads, validates, and parses configuration; it never modifies or prints configuration contents.
+- Stable releases publish Linux archives and ad-hoc-signed macOS archives without requiring Apple credentials. Release notes explicitly identify the macOS binaries as neither Developer ID signed nor notarized.
 
 ### Security
 
