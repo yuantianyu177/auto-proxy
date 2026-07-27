@@ -17,13 +17,8 @@ if [[ ! -d "${bundle_directory}" || -L "${bundle_directory}" ]]; then
   exit 1
 fi
 files=(
-  "CHANGELOG.md"
-  "config.example.toml"
-  "LICENSE"
-  "README.md"
   "ap-v${version}-aarch64-apple-darwin.tar.gz"
   "ap-v${version}-aarch64-unknown-linux-musl.tar.gz"
-  "ap-v${version}-sbom.cdx.json"
   "ap-v${version}-x86_64-apple-darwin.tar.gz"
   "ap-v${version}-x86_64-unknown-linux-musl.tar.gz"
 )

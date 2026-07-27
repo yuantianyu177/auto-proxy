@@ -7,9 +7,9 @@ Stable releases are built by [`.github/workflows/release.yml`](.github/workflows
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
-Each `tar.gz` must contain exactly eight members: `ap`, `README.md`, `RELEASING.md`, `CHANGELOG.md`, `config.example.toml`, `LICENSE`, `LICENSE-MIT`, and `LICENSE-APACHE`.
+Each `tar.gz` must contain one top-level directory with exactly eight files: `ap`, `README.md`, `RELEASING.md`, `CHANGELOG.md`, `config.example.toml`, `LICENSE`, `LICENSE-MIT`, and `LICENSE-APACHE`.
 
-The complete release bundle must verify exactly nine hashed assets: four target archives, `README.md`, `LICENSE`, `CHANGELOG.md`, `config.example.toml`, and the CycloneDX JSON SBOM. `SHA256SUMS` is published as the tenth asset but does not recursively contain its own hash. `verify-release-bundle.sh` verifies the checksum entries, SBOM metadata, exact archive membership, file types and permissions, and binary architectures. Linux artifacts must also be statically linked.
+The complete release bundle must contain exactly five assets: four target archives and `SHA256SUMS`. The checksum file contains one entry for each archive and does not recursively contain its own hash. `verify-release-bundle.sh` verifies the checksums, exact archive membership, file types and permissions, and binary architectures. Linux artifacts must also be statically linked.
 
 ## v2 release scope
 
@@ -32,7 +32,9 @@ A release candidate must conform to the current v2 behavior and must not retain 
 
 Both macOS archives intentionally contain binaries with only an ad-hoc signature. The stable identifier `dev.approxy.ap` and ad-hoc CDHash support ap's internal process-identity checks, but provide no Apple publisher trust. The binaries are not signed with an Apple Developer ID or notarized. The release workflow requires no Apple certificate, private key, or signing secret; the `release` Environment remains only as a protected publication gate.
 
-GitHub Release notes must place this limitation before the automatically generated notes, because macOS Gatekeeper may block the binaries or require manual approval.
+GitHub Release notes must place this limitation before the version changelog, because macOS Gatekeeper may block the binaries or require manual approval.
+
+The remainder of the Release notes must contain the matching version section from `CHANGELOG.md` as direct Markdown text. Do not use GitHub-generated notes or replace the changelog with a link.
 
 `SHA256SUMS` verifies download integrity but does not authenticate an Apple code-signing identity. If trusted public macOS distribution becomes a requirement, add Developer ID signing and Apple notarization as explicit release gates rather than silently changing the artifact policy.
 
@@ -93,13 +95,6 @@ bash scripts/package-release.sh \
   dist
 ```
 
-Generate the SBOM and prepare the standalone documentation assets for the bundle:
-
-```bash
-bash scripts/generate-sbom.sh 0.1.0 dist/ap-v0.1.0-sbom.cdx.json
-install -m 0644 README.md LICENSE CHANGELOG.md config.example.toml dist/
-```
-
 All four target archives must exist before verifying the complete bundle:
 
 ```bash
@@ -116,7 +111,7 @@ The verification script rejects missing, extra, symbolic-link, duplicate, or unh
 3. Generate the complete bundle locally and pass `verify-release-bundle.sh`.
 4. Merge the candidate commit and confirm that its full CI run passes.
 5. Create and push a `v<semver>` tag matching the Cargo version.
-6. Confirm that the tagged workflow passes the full CI suite, creates all four archives, applies only the expected ad-hoc signatures to macOS binaries, generates the SBOM and checksums, and verifies the bundle.
-7. The workflow first creates a private draft and publishes it only after verifying every remote asset's SHA-256 and the tag commit. Confirm that the GitHub Release contains `config.example.toml` and every expected asset.
+6. Confirm that the tagged workflow passes the full CI suite, creates all four archives, applies only the expected ad-hoc signatures to macOS binaries, generates `SHA256SUMS`, and verifies the bundle.
+7. The workflow first creates a private draft and publishes it only after verifying every remote asset's SHA-256 and the tag commit. Confirm that the GitHub Release contains the version changelog as direct text and exactly the four target archives and `SHA256SUMS`, in addition to GitHub's automatic source archives.
 
 Never create a stable release from a manual dry-run artifact; only the tagged workflow may publish.

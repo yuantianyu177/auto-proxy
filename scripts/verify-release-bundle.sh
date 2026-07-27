@@ -16,10 +16,6 @@ if [[ ! -d "${bundle_directory}" || -L "${bundle_directory}" ]]; then
   echo "bundle directory must be a real directory: ${bundle_directory}" >&2
   exit 1
 fi
-command -v jq >/dev/null || {
-  echo "jq is required to verify the release bundle" >&2
-  exit 1
-}
 command -v file >/dev/null || {
   echo "file is required to verify release binary formats" >&2
   exit 1
@@ -34,22 +30,16 @@ trap cleanup EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
-sbom="${bundle_directory}/ap-v${version}-sbom.cdx.json"
 checksum_file="${bundle_directory}/SHA256SUMS"
 
-if [[ ! -f "${checksum_file}" || -L "${checksum_file}" || ! -f "${sbom}" || -L "${sbom}" ]]; then
-  echo "release bundle is missing SHA256SUMS or its SBOM" >&2
+if [[ ! -f "${checksum_file}" || -L "${checksum_file}" ]]; then
+  echo "release bundle is missing SHA256SUMS" >&2
   exit 1
 fi
 
 expected_files=(
-  "CHANGELOG.md"
-  "config.example.toml"
-  "LICENSE"
-  "README.md"
   "ap-v${version}-aarch64-apple-darwin.tar.gz"
   "ap-v${version}-aarch64-unknown-linux-musl.tar.gz"
-  "ap-v${version}-sbom.cdx.json"
   "ap-v${version}-x86_64-apple-darwin.tar.gz"
   "ap-v${version}-x86_64-unknown-linux-musl.tar.gz"
 )
@@ -159,11 +149,3 @@ do
     exit 1
   fi
 done
-
-jq -e \
-  --arg version "${version}" '
-    .bomFormat == "CycloneDX"
-    and .specVersion == "1.5"
-    and .metadata.component.name == "ap"
-    and .metadata.component.version == $version
-  ' "${sbom}" >/dev/null

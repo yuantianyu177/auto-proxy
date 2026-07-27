@@ -29,6 +29,38 @@ if [[ ! -d "${bundle_directory}" || -L "${bundle_directory}" ]]; then
   echo "bundle directory must be a real directory: ${bundle_directory}" >&2
   exit 1
 fi
+if [[ ! -f CHANGELOG.md || -L CHANGELOG.md ]]; then
+  echo "CHANGELOG.md must be a regular, non-symlink file" >&2
+  exit 1
+fi
+
+release_version="${release_tag#v}"
+changelog_section="$(
+  awk -v version="${release_version}" '
+    $0 == "## [" version "]" || index($0, "## [" version "] - ") == 1 {
+      found = 1
+      next
+    }
+    found && /^## \[/ {
+      exit
+    }
+    found {
+      print
+    }
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  ' CHANGELOG.md
+)" || {
+  echo "CHANGELOG.md has no section for ${release_version}" >&2
+  exit 1
+}
+if ! grep -q '[^[:space:]]' <<< "${changelog_section}"; then
+  echo "CHANGELOG.md section for ${release_version} is empty" >&2
+  exit 1
+fi
 
 if command -v sha256sum >/dev/null 2>&1; then
   checksum_command=(sha256sum)
@@ -109,12 +141,16 @@ if gh release view "${release_tag}" >/dev/null 2>&1; then
 fi
 
 release_notice=$'## macOS artifacts are not Developer ID signed\n\nThe binaries in the `x86_64-apple-darwin` and `aarch64-apple-darwin` archives carry only an ad-hoc signature required by ap process-identity checks. They are not signed with an Apple Developer ID or notarized. macOS Gatekeeper may block them or require manual approval. Verify downloads against `SHA256SUMS`.'
+notes_file="$(mktemp)"
+{
+  printf '%s\n\n' "${release_notice}"
+  printf '## Changelog\n%s\n' "${changelog_section}"
+} > "${notes_file}"
 create_arguments=(
   "${release_tag}"
   --draft
   --verify-tag
-  --generate-notes
-  --notes "${release_notice}"
+  --notes-file "${notes_file}"
   --title "ap ${release_tag}"
 )
 if [[ "${prerelease}" == true ]]; then
@@ -125,6 +161,7 @@ release_created=false
 cleanup_failed_draft() {
   local status=$?
   local draft_state
+  rm -f "${notes_file}"
   if [[ "${status}" -ne 0 && "${release_created}" == true ]]; then
     draft_state="$(gh release view "${release_tag}" --json isDraft --jq '.isDraft' 2>/dev/null || true)"
     if [[ "${draft_state}" == true ]]; then
@@ -171,4 +208,5 @@ fi
 assert_tag_commit "before publication"
 gh release edit "${release_tag}" --draft=false
 release_created=false
+rm -f "${notes_file}"
 trap - EXIT HUP INT TERM

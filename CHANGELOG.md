@@ -4,6 +4,10 @@ This project follows Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- GitHub Releases now publish only the four target archives and `SHA256SUMS`, with the version changelog rendered directly in the Release notes.
+
 ## [0.1.0] - 2026-07-28
 
 ### Added
@@ -15,7 +19,7 @@ This project follows Semantic Versioning.
 - Fresh remote proxy credentials for every explicit connection start or restart, followed by remote environment-variable instructions after a successful connection.
 - Consistent use of `XDG_CONFIG_HOME`, `XDG_STATE_HOME`, and `XDG_RUNTIME_DIR` on macOS and Linux, with a secure runtime fallback.
 - A dedicated XDG `known_hosts` file, OpenSSH ControlMaster, a parent-process watchdog, and automatic reconnection after network failures for key-authenticated connections.
-- Authenticated HTTP, SOCKS5, and mixed local gateways, plus a four-target Linux musl/macOS release pipeline with SBOM and SHA-256 checksums.
+- Authenticated HTTP, SOCKS5, and mixed local gateways, plus a four-target Linux musl/macOS release pipeline with SHA-256 checksums.
 
 ### Changed
 
