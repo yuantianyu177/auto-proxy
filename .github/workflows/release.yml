@@ -245,7 +245,7 @@ jobs:
     name: Package ${{ matrix.target }}
     if: >-
       ${{
-        always()
+        !cancelled()
         && needs.prepare.result == 'success'
         && needs.quality.result == 'success'
         && needs.build-macos.result == 'success'
@@ -306,6 +306,13 @@ jobs:
 
   bundle:
     name: Generate and verify release bundle
+    if: >-
+      ${{
+        !cancelled()
+        && needs.prepare.result == 'success'
+        && needs.build-linux.result == 'success'
+        && needs.package-macos.result == 'success'
+      }}
     needs:
       - prepare
       - build-linux
